@@ -95,48 +95,65 @@ func saveState(state *State, final bool, snapshotDir string) error {
 	return nil
 }
 
-// rpcQuery sends an RPC request
+// Update rpcQuery to add retries and better error handling
 func rpcQuery(method string, params map[string]interface{}) (map[string]interface{}, error) {
-	payload := map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  method,
-		"params":  params,
+	maxRetries := 3
+	var lastErr error
+
+	for retry := 0; retry < maxRetries; retry++ {
+		if retry > 0 {
+			logger.Printf("Retry %d/%d for %s...", retry, maxRetries, method)
+			time.Sleep(time.Second * time.Duration(retry)) // Exponential backoff
+		}
+
+		payload := map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      1,
+			"method":  method,
+			"params":  params,
+		}
+
+		body, err := json.Marshal(payload)
+		if err != nil {
+			return nil, fmt.Errorf("marshal payload: %v", err)
+		}
+
+		resp, err := httpClient.Post(RPC_URL, "application/json", bytes.NewReader(body))
+		if err != nil {
+			lastErr = fmt.Errorf("RPC request failed: %v", err)
+			continue
+		}
+
+		// Read full response for better error reporting
+		respBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("reading response body: %v", err)
+			continue
+		}
+
+		// Try to decode as JSON
+		var result map[string]interface{}
+		if err := json.Unmarshal(respBody, &result); err != nil {
+			lastErr = fmt.Errorf("decode response failed (%s): %v", string(respBody), err)
+			continue
+		}
+
+		if errData, ok := result["error"]; ok {
+			lastErr = fmt.Errorf("RPC error: %v", errData)
+			continue
+		}
+
+		resultData, ok := result["result"].(map[string]interface{})
+		if !ok {
+			lastErr = fmt.Errorf("invalid result format: %v", result["result"])
+			continue
+		}
+
+		return resultData, nil
 	}
 
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return nil, fmt.Errorf("marshal payload: %v", err)
-	}
-
-	resp, err := httpClient.Post(RPC_URL, "application/json", bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("RPC request failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	// Read the full response body
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("reading response body: %v", err)
-	}
-
-	// Try to decode as JSON
-	var result map[string]interface{}
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, fmt.Errorf("decode response failed (%s): %v", string(respBody), err)
-	}
-
-	if errData, ok := result["error"]; ok {
-		return nil, fmt.Errorf("RPC error: %v", errData)
-	}
-
-	resultData, ok := result["result"].(map[string]interface{})
-	if !ok {
-		return nil, fmt.Errorf("invalid result format: %v", result["result"])
-	}
-
-	return resultData, nil
+	return nil, fmt.Errorf("after %d retries: %v", maxRetries, lastErr)
 }
 
 // fetchRPC fetches data via RPC with pagination
@@ -683,7 +700,7 @@ func updateBalances(accounts []map[string]interface{}, height int64, snapshotDir
 	}
 
 	// Create buffered channels
-	workers := 50
+	workers := 150
 	bufferSize := len(accounts)
 	jobs := make(chan string, bufferSize)
 	results := make(chan map[string]interface{}, bufferSize)
@@ -930,13 +947,45 @@ func updateReadme(height int64, snapshotDir string, balances []map[string]interf
 	return nil
 }
 
+// Add this function to find incomplete snapshots
+func findIncompleteSnapshot() (string, int64, error) {
+	entries, err := os.ReadDir("snapshots")
+	if err != nil && !os.IsNotExist(err) {
+		return "", 0, fmt.Errorf("failed to read snapshots directory: %v", err)
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "height_") {
+			continue
+		}
+
+		heightStr := strings.TrimPrefix(entry.Name(), "height_")
+		height, err := strconv.ParseInt(heightStr, 10, 64)
+		if err != nil {
+			continue
+		}
+
+		// Check if this snapshot is incomplete
+		snapshotDir := filepath.Join("snapshots", entry.Name())
+		stateFile := filepath.Join(snapshotDir, "state.json")
+		if _, err := os.Stat(stateFile); os.IsNotExist(err) {
+			logger.Printf("Found incomplete snapshot at height %d", height)
+			return snapshotDir, height, nil
+		}
+	}
+
+	return "", 0, nil
+}
+
 func main() {
 	logger.Println("=== Starting Unicorn Snapshot ===")
 	logger.Printf("Block height check...")
 
-	// Initialize data map and accounts slice
+	// Initialize variables
 	data := make(map[string][]map[string]interface{})
 	var accounts []map[string]interface{}
+	var snapshotDir string
+	var err error
 
 	var newPrefix string
 	flag.StringVar(&newPrefix, "prefix", "unicorn", "New Bech32 prefix (default: unicorn)")
@@ -945,19 +994,35 @@ func main() {
 	flag.Parse()
 	logger.Printf("Using Bech32 prefix: %s", newPrefix)
 
-	// Load state from snapshot directory
-	snapshotDir, err := ensureSnapshotDir(0)
+	// Get latest block height first
+	latestHeight, err := getLatestBlockHeight()
 	if err != nil {
-		logger.Fatalf("Failed to create snapshot directory: %v", err)
+		logger.Fatalf("Get block height failed: %v", err)
 	}
 
+	// Then check for incomplete snapshots
+	if incompleteDir, incompleteHeight, err := findIncompleteSnapshot(); err != nil {
+		logger.Printf("Warning: Error checking for incomplete snapshots: %v", err)
+	} else if incompleteDir != "" {
+		logger.Printf("Resuming incomplete snapshot at height %d", incompleteHeight)
+		snapshotDir = incompleteDir
+		latestHeight = incompleteHeight
+	} else {
+		// No incomplete snapshots found, create new one
+		snapshotDir, err = ensureSnapshotDir(latestHeight)
+		if err != nil {
+			logger.Fatalf("Failed to create snapshot directory: %v", err)
+		}
+	}
+
+	// Load state from snapshot directory
 	state, err := loadState(snapshotDir)
 	if err != nil {
 		logger.Fatalf("Load state failed: %v", err)
 	}
 
 	// Get latest block height
-	latestHeight, err := getLatestBlockHeight()
+	latestHeight, err = getLatestBlockHeight()
 	if err != nil {
 		logger.Fatalf("Get block height failed: %v", err)
 	}
@@ -1190,51 +1255,12 @@ func main() {
 	}
 }
 
-// Add this function to check completion
-func (s *State) isHeightComplete() bool {
-	return s.AccountsComplete && s.BalancesComplete && s.ValidatorsComplete
-}
-
-// Add this function to reset completion flags
-func (s *State) startNewHeight(height int64) {
-	if s.isHeightComplete() {
-		s.LastCompleteHeight = s.BlockHeight
-	} else {
-		s.LastIncompleteHeight = s.BlockHeight
-	}
-	s.BlockHeight = height
-	s.AccountsComplete = false
-	s.BalancesComplete = false
-	s.ValidatorsComplete = false
-}
-
-// Add this function to manage temp files
-func (s *State) trackTempFile(finalName, tempName string) {
-	if s.InProgressFiles == nil {
-		s.InProgressFiles = make(map[string]string)
-	}
-	s.InProgressFiles[finalName] = tempName
-}
-
-// Add this function to commit completed files
-func (s *State) commitFiles() error {
-	logger.Println("Committing completed files...")
-	for finalName, tempName := range s.InProgressFiles {
-		if err := os.Rename(tempName, finalName); err != nil {
-			return fmt.Errorf("failed to commit %s: %v", finalName, err)
-		}
-		logger.Printf("Committed %s", finalName)
-		delete(s.InProgressFiles, finalName)
-	}
-	return nil
-}
-
 // Add this function that was referenced but missing
 func fetchAccountsParallel() ([]map[string]interface{}, error) {
 	logger.Println("Starting parallel account fetch...")
 
 	// Create channels for parallel processing
-	workers := 100
+	workers := 1600
 	jobs := make(chan int64, workers*2)
 	results := make(chan map[string]interface{}, workers*2)
 
@@ -1356,26 +1382,6 @@ func checkForNewAccounts(lastKnownNum int64) (int64, error) {
 	}
 
 	return lastKnownNum, nil
-}
-
-// Add this function to clean up temp files
-func cleanupTempFiles() {
-	logger.Println("Cleaning up temporary files...")
-	tempFiles := []string{
-		"balances.json.tmp",
-		"delegations.json.tmp",
-		"validators.json.tmp",
-		"metadatas.json.tmp",
-		"state.json.tmp",
-		"total_balances.json.tmp",
-		"richlist.json.tmp",
-	}
-
-	for _, file := range tempFiles {
-		if err := os.Remove(file); err != nil && !os.IsNotExist(err) {
-			logger.Printf("Warning: Failed to remove %s: %v", file, err)
-		}
-	}
 }
 
 // Update cleanupAllTempFiles to work in snapshot directory

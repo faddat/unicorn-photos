@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -24,6 +26,7 @@ type State struct {
 	LastBalanceIndex   int      `json:"last_balance_index"`
 	CompletedBalances  bool     `json:"completed_balances"`
 	CompletedSnapshots []string `json:"completed_snapshots"`
+	BlockHeight        int64    `json:"block_height"`
 }
 
 // loadState loads the current state or initializes a new one.
@@ -52,9 +55,18 @@ func saveState(state *State) error {
 }
 
 // fetchWithRetry performs an HTTP GET with retries on failure.
-func fetchWithRetry(url string, maxRetries int) (*http.Response, error) {
+func fetchWithRetry(url string, blockHeight int64, maxRetries int) (*http.Response, error) {
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		resp, err := http.Get(url)
+		client := &http.Client{}
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			return nil, err
+		}
+		if blockHeight > 0 {
+			req.Header.Add("x-cosmos-block-height", fmt.Sprintf("%d", blockHeight))
+		}
+
+		resp, err := client.Do(req)
 		if err == nil && resp.StatusCode == http.StatusOK {
 			return resp, nil
 		}
@@ -77,7 +89,7 @@ func fetchWithRetry(url string, maxRetries int) (*http.Response, error) {
 func fetchAll(endpoint, itemsKey string, state *State) ([]map[string]interface{}, error) {
 	var allItems []map[string]interface{}
 	if _, err := os.Stat(itemsKey + ".json"); err == nil && state.CompletedAccounts {
-		data, err := ioutil.ReadFile(itemsKey + ".json")
+		data, err := os.ReadFile(itemsKey + ".json")
 		if err == nil {
 			if err := json.Unmarshal(data, &allItems); err == nil {
 				fmt.Printf("Loaded %d %s from cache.\n", len(allItems), itemsKey)
@@ -86,58 +98,111 @@ func fetchAll(endpoint, itemsKey string, state *State) ([]map[string]interface{}
 		}
 	}
 
-	nextKey := state.AccountNextKey
-	page := state.LastAccountPage + 1
+	// Get first page to determine total pages
+	baseURL := fmt.Sprintf("%s%s", REST_URL, endpoint)
+	params := url.Values{}
+	params.Add("pagination.limit", "100")
+	fullURL := fmt.Sprintf("%s?%s", baseURL, params.Encode())
 
-	for {
-		baseURL := fmt.Sprintf("%s%s", REST_URL, endpoint)
-		params := url.Values{}
-		params.Add("pagination.limit", "100")
-		if nextKey != "" {
-			params.Add("pagination.key", nextKey)
-		}
-		fullURL := fmt.Sprintf("%s?%s", baseURL, params.Encode())
+	resp, err := fetchWithRetry(fullURL, state.BlockHeight, 3)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch first page: %v", err)
+	}
+	defer resp.Body.Close()
 
-		fmt.Printf("Fetching %s page %d: %s\n", itemsKey, page, fullURL)
-		resp, err := fetchWithRetry(fullURL, 3)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch %s after retries: %v", itemsKey, err)
-		}
-		defer resp.Body.Close()
+	var firstPage map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&firstPage); err != nil {
+		return nil, fmt.Errorf("JSON decode error: %v", err)
+	}
 
-		var data map[string]interface{}
-		if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-			return nil, fmt.Errorf("JSON decode error for %s: %v", itemsKey, err)
+	pagination := firstPage["pagination"].(map[string]interface{})
+	total := int(pagination["total"].(float64))
+	pageSize := 100
+	numPages := (total + pageSize - 1) / pageSize
+
+	// Create worker pool for parallel fetching
+	type pageResult struct {
+		items []map[string]interface{}
+		page  int
+		err   error
+	}
+
+	workers := 50
+	jobs := make(chan int, numPages)
+	results := make(chan pageResult, numPages)
+	rateLimit := time.NewTicker(time.Millisecond * 20) // 50 requests per second
+	defer rateLimit.Stop()
+
+	// Start workers
+	for w := 0; w < workers; w++ {
+		go func() {
+			for page := range jobs {
+				<-rateLimit.C
+				pageURL := fmt.Sprintf("%s?pagination.limit=%d&pagination.offset=%d", baseURL, pageSize, page*pageSize)
+				resp, err := fetchWithRetry(pageURL, state.BlockHeight, 3)
+				if err != nil {
+					results <- pageResult{page: page, err: err}
+					continue
+				}
+
+				var data map[string]interface{}
+				if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+					resp.Body.Close()
+					results <- pageResult{page: page, err: err}
+					continue
+				}
+				resp.Body.Close()
+
+				items, ok := data[itemsKey].([]interface{})
+				if !ok {
+					results <- pageResult{page: page, err: fmt.Errorf("invalid response format")}
+					continue
+				}
+
+				pageItems := make([]map[string]interface{}, len(items))
+				for i, item := range items {
+					pageItems[i] = item.(map[string]interface{})
+				}
+				results <- pageResult{items: pageItems, page: page}
+			}
+		}()
+	}
+
+	// Send jobs
+	go func() {
+		for i := 0; i < numPages; i++ {
+			jobs <- i
+		}
+		close(jobs)
+	}()
+
+	// Collect results
+	allItems = make([]map[string]interface{}, 0, total)
+	processed := 0
+	for result := range results {
+		processed++
+		if result.err != nil {
+			fmt.Printf("Warning: Failed to fetch page %d: %v\n", result.page, result.err)
+			continue
+		}
+		allItems = append(allItems, result.items...)
+
+		if processed%10 == 0 || processed == numPages {
+			fmt.Printf("Fetched %d/%d pages of %s\n", processed, numPages, itemsKey)
+			// Cache intermediate results
+			dataBytes, _ := json.MarshalIndent(allItems, "", "  ")
+			os.WriteFile(itemsKey+".json", dataBytes, 0644)
 		}
 
-		items, ok := data[itemsKey].([]interface{})
-		if !ok {
-			return nil, fmt.Errorf("invalid response format for %s", itemsKey)
-		}
-		for _, item := range items {
-			allItems = append(allItems, item.(map[string]interface{}))
-		}
-
-		// Save progress
-		pagination, ok := data["pagination"].(map[string]interface{})
-		if !ok || pagination["next_key"] == nil {
-			state.CompletedAccounts = true
+		if processed >= numPages {
 			break
 		}
-		nextKey = pagination["next_key"].(string)
-		state.AccountNextKey = nextKey
-		state.LastAccountPage = page
-		if err := saveState(state); err != nil {
-			log.Printf("Warning: Failed to save state: %v", err)
-		}
-		// Cache items
-		dataBytes, _ := json.MarshalIndent(allItems, "", "  ")
-		os.WriteFile(itemsKey+".json", dataBytes, 0644)
-		page++
 	}
+
+	state.CompletedAccounts = true
+	saveState(state)
+
 	fmt.Printf("Completed fetching %d %s.\n", len(allItems), itemsKey)
-	dataBytes, _ := json.MarshalIndent(allItems, "", "  ")
-	os.WriteFile(itemsKey+".json", dataBytes, 0644)
 	return allItems, nil
 }
 
@@ -157,7 +222,7 @@ func fetchParams(endpoint string, state *State) (map[string]interface{}, error) 
 	fullURL := fmt.Sprintf("%s%s", REST_URL, endpoint)
 	fmt.Printf("Fetching parameters from %s\n", fullURL)
 
-	resp, err := fetchWithRetry(fullURL, 3)
+	resp, err := fetchWithRetry(fullURL, state.BlockHeight, 3)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch params after retries: %v", err)
 	}
@@ -191,7 +256,7 @@ func fetchBalances(address string, index, total int, state *State) ([]map[string
 	}
 
 	fmt.Printf("Fetching balances for account %d/%d: %s\n", index+1, total, address)
-	resp, err := fetchWithRetry(url, 3)
+	resp, err := fetchWithRetry(url, state.BlockHeight, 3)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch balances after retries: %v", err)
 	}
@@ -216,14 +281,42 @@ func contains(slice []string, item string) bool {
 	return false
 }
 
-func main() {
-	fmt.Println("Starting snapshot process...")
+// getLatestBlockHeight retrieves the latest block height from the blockchain.
+func getLatestBlockHeight() (int64, error) {
+	url := fmt.Sprintf("%s/cosmos/base/tendermint/v1beta1/blocks/latest", REST_URL)
+	resp, err := fetchWithRetry(url, 0, 3)
+	if err != nil {
+		return 0, fmt.Errorf("failed to fetch latest block: %v", err)
+	}
+	defer resp.Body.Close()
 
-	// Load or initialize state
+	var data struct {
+		Block struct {
+			Header struct {
+				Height string `json:"height"`
+			} `json:"header"`
+		} `json:"block"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return 0, fmt.Errorf("failed to decode block response: %v", err)
+	}
+
+	return strconv.ParseInt(data.Block.Header.Height, 10, 64)
+}
+
+func main() {
+	// Get latest block height
+	blockHeight, err := getLatestBlockHeight()
+	if err != nil {
+		log.Fatalf("Failed to get latest block height: %v", err)
+	}
+	fmt.Printf("Starting snapshot process at block height %d...\n", blockHeight)
+
 	state, err := loadState()
 	if err != nil {
 		log.Fatalf("Failed to load state: %v", err)
 	}
+	state.BlockHeight = blockHeight
 
 	// Step 1: Fetch all accounts
 	fmt.Println("Step 1: Fetching all accounts...")
@@ -551,7 +644,37 @@ func main() {
 		log.Fatalf("Failed to write genesis.json: %v", err)
 	}
 
+	// Before exiting, update README.md
+	readmeContent, err := os.ReadFile("README.md")
+	if err != nil && !os.IsNotExist(err) {
+		log.Printf("Warning: Failed to read README.md: %v", err)
+	}
+
+	var newContent string
+	if len(readmeContent) > 0 {
+		// Find the last snapshot line and replace it
+		lines := strings.Split(string(readmeContent), "\n")
+		found := false
+		for i, line := range lines {
+			if strings.Contains(line, "Latest snapshot from block height") {
+				lines[i] = fmt.Sprintf("Latest snapshot from block height: %d", blockHeight)
+				found = true
+				break
+			}
+		}
+		if !found {
+			lines = append(lines, "", fmt.Sprintf("Latest snapshot from block height: %d", blockHeight))
+		}
+		newContent = strings.Join(lines, "\n")
+	} else {
+		newContent = fmt.Sprintf("Latest snapshot from block height: %d\n", blockHeight)
+	}
+
+	if err := os.WriteFile("README.md", []byte(newContent), 0644); err != nil {
+		log.Printf("Warning: Failed to update README.md: %v", err)
+	}
+
 	// Clean up state file on success
 	os.Remove("state.json")
-	fmt.Println("Snapshot completed successfully! Check genesis.json.")
+	fmt.Printf("Snapshot completed successfully at block height %d! Check genesis.json.\n", blockHeight)
 }

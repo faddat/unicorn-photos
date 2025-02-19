@@ -1,5 +1,5 @@
 # unicorn photos
 
-the concepts behind unicorn and memes are very pure. 
+Code and output for a bespoke snapshot utility for Unicorn and Memes.  
 
-so i made sure that we know whats up
+This frees the unicorn.

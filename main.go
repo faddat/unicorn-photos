@@ -596,96 +596,81 @@ func min(a, b int) int {
 	return b
 }
 
-// Add this function to handle balance updates
+// Update the shouldUpdateBalances function to be more permissive
+func shouldUpdateBalances(oldHeight, newHeight int64) bool {
+	// Always update balances if they don't exist
+	if _, err := os.Stat("balances.json"); os.IsNotExist(err) {
+		logger.Println("No existing balances.json, will fetch balances")
+		return true
+	}
+
+	// Update if height changed
+	if oldHeight != newHeight {
+		logger.Printf("Block height changed from %d to %d, will update balances",
+			oldHeight, newHeight)
+		return true
+	}
+
+	return false
+}
+
+// Update the updateBalances function to ensure it always writes the file
 func updateBalances(accounts []map[string]interface{}, height int64) ([]map[string]interface{}, error) {
-	logger.Printf("Updating balances at height %d", height)
-	balances := make([]map[string]interface{}, 0, len(accounts))
+	logger.Printf("Updating balances for %d accounts at height %d", len(accounts), height)
 
-	// Create channels for parallel processing
-	type balanceResult struct {
-		balance map[string]interface{}
-		err     error
-		addr    string
-	}
-
-	workers := 50
-	jobs := make(chan string, workers*2)
-	results := make(chan balanceResult, workers*2)
-
-	// Start workers
-	for w := 0; w < workers; w++ {
-		go func() {
-			for addr := range jobs {
-				url := fmt.Sprintf("https://rest.unicorn.meme/cosmos/bank/v1beta1/balances/%s", addr)
-				resp, err := httpClient.Get(url)
-				if err != nil {
-					results <- balanceResult{err: err, addr: addr}
-					continue
-				}
-
-				var result struct {
-					Balances []map[string]interface{} `json:"balances"`
-				}
-				if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-					resp.Body.Close()
-					results <- balanceResult{err: err, addr: addr}
-					continue
-				}
-				resp.Body.Close()
-
-				if len(result.Balances) > 0 {
-					results <- balanceResult{
-						balance: map[string]interface{}{
-							"address": addr,
-							"coins":   result.Balances,
-						},
-					}
-				}
-			}
-		}()
-	}
-
-	// Send jobs
-	go func() {
-		for _, acc := range accounts {
-			if addr, ok := acc["address"].(string); ok {
-				jobs <- addr
-			}
-		}
-		close(jobs)
-	}()
-
-	// Collect results
-	processed := 0
-	total := len(accounts)
-	lastLog := time.Now()
-	for result := range results {
-		processed++
-		if result.err != nil {
-			logger.Printf("Error fetching balance for %s: %v", result.addr, result.err)
+	balances := make([]map[string]interface{}, 0)
+	for i, account := range accounts {
+		addr, ok := account["address"].(string)
+		if !ok {
 			continue
 		}
-		if result.balance != nil {
-			balances = append(balances, result.balance)
+
+		// Get balance
+		url := fmt.Sprintf("https://rest.unicorn.meme/cosmos/bank/v1beta1/balances/%s", addr)
+		resp, err := fetchWithBackoff(url, 5)
+		if err != nil {
+			logger.Printf("Warning: Failed to get balance for %s: %v", addr, err)
+			continue
 		}
 
-		// Log progress every 5 seconds
-		if time.Since(lastLog) > 5*time.Second {
-			logger.Printf("Progress: %d/%d balances fetched (%.2f%%)",
-				processed, total, float64(processed)/float64(total)*100)
-			lastLog = time.Now()
+		var balanceResp struct {
+			Balances []map[string]interface{} `json:"balances"`
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			logger.Printf("Warning: Failed to read balance response for %s: %v", addr, err)
+			continue
 		}
 
-		if processed >= total {
-			break
+		if err := json.Unmarshal(body, &balanceResp); err != nil {
+			logger.Printf("Warning: Failed to parse balance for %s: %v", addr, err)
+			continue
+		}
+
+		// Only add non-zero balances
+		for _, bal := range balanceResp.Balances {
+			balances = append(balances, map[string]interface{}{
+				"address": addr,
+				"coins":   []map[string]interface{}{bal},
+			})
+		}
+
+		if i > 0 && i%100 == 0 {
+			logger.Printf("Processed balances for %d/%d accounts", i, len(accounts))
+			// Save progress periodically
+			if err := writeJSONFile("balances.json", balances); err != nil {
+				logger.Printf("Warning: Failed to save balance progress: %v", err)
+			}
 		}
 	}
 
-	// Save balances
+	// Always write final balances file
 	if err := writeJSONFile("balances.json", balances); err != nil {
-		return nil, fmt.Errorf("failed to save balances: %v", err)
+		return nil, fmt.Errorf("failed to write balances: %v", err)
 	}
 
+	logger.Printf("Updated balances.json with %d balance entries", len(balances))
 	return balances, nil
 }
 
@@ -731,11 +716,6 @@ func validateAccounts(filename string) (bool, int64) {
 
 	logger.Printf("Validated %d accounts, last account number: %d", len(accounts), lastNum)
 	return true, lastNum
-}
-
-// Add this function to check if we need to update balances
-func shouldUpdateBalances(oldHeight, newHeight int64) bool {
-	return oldHeight != newHeight
 }
 
 // Add this function for exponential backoff

@@ -1,19 +1,15 @@
 package main
 
 import (
-	"bytes"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,26 +35,8 @@ type fetchResult struct {
 	Err     error
 }
 
-// Logger with buffering for performance
-var logger = log.New(&bufferedWriter{Writer: os.Stdout}, "[SNAPSHOT] ", log.Ldate|log.Ltime|log.Lmicroseconds)
-
-// bufferedWriter reduces I/O overhead by buffering log output
-type bufferedWriter struct {
-	sync.Mutex
-	Writer io.Writer
-	Buffer bytes.Buffer
-}
-
-func (bw *bufferedWriter) Write(p []byte) (n int, err error) {
-	bw.Mutex.Lock()
-	defer bw.Mutex.Unlock()
-	bw.Buffer.Write(p)
-	if bytes.Contains(p, []byte("\n")) {
-		_, err = bw.Writer.Write(bw.Buffer.Bytes())
-		bw.Buffer.Reset()
-	}
-	return len(p), err
-}
+// Logger with verbose output
+var logger = log.New(os.Stdout, "[SNAPSHOT] ", log.Ldate|log.Ltime|log.Lmicroseconds)
 
 // httpClient with connection pooling
 var httpClient = &http.Client{
@@ -77,9 +55,9 @@ func loadState() (*State, error) {
 		logger.Println("No existing state found, initializing new state.")
 		return &State{CompletedEndpoints: make(map[string]string)}, nil
 	}
-	data, err := decompressFile("state.json.tmp")
+	data, err := ioutil.ReadFile("state.json.tmp")
 	if err != nil {
-		logger.Printf("Failed to read/decompress state.json.tmp: %v", err)
+		logger.Printf("Failed to read state.json.tmp: %v", err)
 		return nil, fmt.Errorf("failed to read state: %v", err)
 	}
 	var state State
@@ -91,7 +69,7 @@ func loadState() (*State, error) {
 	return &state, nil
 }
 
-// saveState saves the state to a temporary compressed file.
+// saveState saves the state to a file.
 func saveState(state *State, final bool) error {
 	logger.Println("Saving state...")
 	data, err := json.MarshalIndent(state, "", "  ")
@@ -103,7 +81,7 @@ func saveState(state *State, final bool) error {
 	if final {
 		filename = "state.json"
 	}
-	if err := compressAndWriteFile(filename, data); err != nil {
+	if err := ioutil.WriteFile(filename, data, 0644); err != nil {
 		logger.Printf("Failed to write %s: %v", filename, err)
 		return err
 	}
@@ -111,7 +89,7 @@ func saveState(state *State, final bool) error {
 	return nil
 }
 
-// fetchWithRetry performs an HTTP GET with retries and adaptive rate limiting.
+// fetchWithRetry performs an HTTP GET with retries.
 func fetchWithRetry(url string, blockHeight int64, limiter *rate.Limiter) (*http.Response, error) {
 	const maxRetries = 3
 	for attempt := 0; attempt <= maxRetries; attempt++ {
@@ -151,10 +129,10 @@ func fetchWithRetry(url string, blockHeight int64, limiter *rate.Limiter) (*http
 	return nil, fmt.Errorf("exhausted retries for %s", url)
 }
 
-// fetchAll fetches paginated data using next-key pagination with a worker pool.
+// fetchAll fetches paginated data with a worker pool.
 func fetchAll(endpoint, itemsKey string, state *State, workers int, limiter *rate.Limiter) ([]map[string]interface{}, error) {
 	const pageSize = 100
-	logger.Printf("Starting fetchAll for %s (%s) with %d workers", endpoint, itemsKey, workers)
+	logger.Printf("Fetching %s (%s) with %d workers", endpoint, itemsKey, workers)
 	jobs := make(chan string, workers*2)
 	results := make(chan fetchResult, workers*2)
 	var wg sync.WaitGroup
@@ -162,14 +140,12 @@ func fetchAll(endpoint, itemsKey string, state *State, workers int, limiter *rat
 	// Load cached data
 	cacheFile := fmt.Sprintf("%s.json.tmp", itemsKey)
 	var allItems []map[string]interface{}
-	if data, err := decompressFile(cacheFile); err == nil {
+	if data, err := ioutil.ReadFile(cacheFile); err == nil {
 		if err := json.Unmarshal(data, &allItems); err == nil {
 			logger.Printf("Loaded %d cached %s from %s", len(allItems), itemsKey, cacheFile)
 		} else {
 			logger.Printf("Failed to unmarshal cached %s: %v", itemsKey, err)
 		}
-	} else {
-		logger.Printf("No cached data found for %s at %s", itemsKey, cacheFile)
 	}
 
 	// Start workers
@@ -202,7 +178,7 @@ func fetchAll(endpoint, itemsKey string, state *State, workers int, limiter *rat
 
 				items, ok := data[itemsKey].([]interface{})
 				if !ok {
-					logger.Printf("Worker %d: Invalid %s format in response", workerID, itemsKey)
+					logger.Printf("Worker %d: Invalid %s format", workerID, itemsKey)
 					results <- fetchResult{Err: fmt.Errorf("invalid %s format", itemsKey)}
 					continue
 				}
@@ -219,9 +195,9 @@ func fetchAll(endpoint, itemsKey string, state *State, workers int, limiter *rat
 		}(i)
 	}
 
-	// Start with initial key from state
+	// Start with initial key
 	nextKey := state.CompletedEndpoints[endpoint]
-	logger.Printf("Starting fetch with initial next_key=%s", nextKey)
+	logger.Printf("Starting with next_key=%s", nextKey)
 	jobs <- nextKey
 	activeJobs := 1
 
@@ -231,7 +207,7 @@ func fetchAll(endpoint, itemsKey string, state *State, workers int, limiter *rat
 		close(results)
 	}()
 
-	seen := make(map[string]struct{}, len(allItems)*2) // Pre-allocate for efficiency
+	seen := make(map[string]struct{})
 	for _, item := range allItems {
 		if addr, ok := item["address"].(string); ok {
 			seen[addr] = struct{}{}
@@ -250,28 +226,24 @@ func fetchAll(endpoint, itemsKey string, state *State, workers int, limiter *rat
 					allItems = append(allItems, item)
 				}
 			} else {
-				allItems = append(allItems, item) // Non-address items (e.g., metadata) added directly
+				allItems = append(allItems, item)
 			}
 		}
 		if result.NextKey != "" {
 			jobs <- result.NextKey
 			activeJobs++
-			logger.Printf("Queued new job with next_key=%s, active jobs=%d", result.NextKey, activeJobs)
+			logger.Printf("Queued next_key=%s, active jobs=%d", result.NextKey, activeJobs)
 		} else {
 			activeJobs--
-			logger.Printf("No next_key, active jobs reduced to %d", activeJobs)
+			logger.Printf("No next_key, active jobs=%d", activeJobs)
 		}
 		if activeJobs > 0 {
 			state.CompletedEndpoints[endpoint] = result.NextKey
-			dataBytes, err := json.Marshal(allItems) // No indent for speed
-			if err != nil {
-				logger.Printf("Failed to marshal %s for caching: %v", itemsKey, err)
+			dataBytes, _ := json.Marshal(allItems)
+			if err := ioutil.WriteFile(cacheFile, dataBytes, 0644); err != nil {
+				logger.Printf("Failed to cache %s: %v", itemsKey, err)
 			} else {
-				if err := compressAndWriteFile(cacheFile, dataBytes); err != nil {
-					logger.Printf("Failed to write %s cache: %v", cacheFile, err)
-				} else {
-					logger.Printf("Cached %d %s to %s", len(allItems), itemsKey, cacheFile)
-				}
+				logger.Printf("Cached %d %s", len(allItems), itemsKey)
 			}
 			if err := saveState(state, false); err != nil {
 				logger.Printf("Failed to save state: %v", err)
@@ -282,18 +254,17 @@ func fetchAll(endpoint, itemsKey string, state *State, workers int, limiter *rat
 
 	if activeJobs == 0 {
 		delete(state.CompletedEndpoints, endpoint)
-		logger.Printf("Completed fetching %s, removed from state", endpoint)
 		if err := saveState(state, false); err != nil {
-			logger.Printf("Failed to save state after completion: %v", err)
+			logger.Printf("Failed to save state: %v", err)
 		}
 	}
-	logger.Printf("Total %s fetched: %d", itemsKey, len(allItems))
+	logger.Printf("Fetched %d %s", len(allItems), itemsKey)
 	return allItems, nil
 }
 
-// fetchBalances fetches balances for all accounts in parallel.
+// fetchBalances fetches balances in parallel.
 func fetchBalances(accounts []map[string]interface{}, state *State, workers int, limiter *rate.Limiter) ([]map[string]interface{}, error) {
-	logger.Println("Starting parallel balance fetch...")
+	logger.Println("Fetching balances...")
 	jobs := make(chan struct {
 		Index   int
 		Address string
@@ -320,20 +291,19 @@ func fetchBalances(accounts []map[string]interface{}, state *State, workers int,
 					Balances []map[string]interface{} `json:"balances"`
 				}
 				if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-					logger.Printf("Worker %d: JSON decode error for %s: %v", workerID, job.Address, err)
+					logger.Printf("Worker %d: JSON decode error: %v", workerID, err)
 					results <- fetchResult{Err: err}
 					continue
 				}
 				for _, bal := range data.Balances {
 					bal["address"] = job.Address
 				}
-				logger.Printf("Worker %d: Fetched %d balances for %s", workerID, len(data.Balances), job.Address)
+				logger.Printf("Worker %d: Fetched %d balances", workerID, len(data.Balances))
 				results <- fetchResult{Items: data.Balances}
 			}
 		}(i)
 	}
 
-	// Send jobs
 	go func() {
 		for i, acc := range accounts {
 			if addr, ok := acc["address"].(string); ok {
@@ -344,16 +314,15 @@ func fetchBalances(accounts []map[string]interface{}, state *State, workers int,
 			}
 		}
 		close(jobs)
-		logger.Println("All balance fetch jobs queued.")
+		logger.Println("All balance jobs queued.")
 	}()
 
-	// Collect results
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	balances := make([]map[string]interface{}, 0, len(accounts))
+	var balances []map[string]interface{}
 	for result := range results {
 		if result.Err != nil {
 			logger.Printf("Balance fetch error: %v", result.Err)
@@ -361,7 +330,7 @@ func fetchBalances(accounts []map[string]interface{}, state *State, workers int,
 		}
 		balances = append(balances, result.Items...)
 	}
-	logger.Printf("Completed balance fetch, total balances: %d", len(balances))
+	logger.Printf("Fetched %d balances", len(balances))
 	return balances, nil
 }
 
@@ -369,7 +338,7 @@ func fetchBalances(accounts []map[string]interface{}, state *State, workers int,
 func fetchParams(endpoint string, state *State, limiter *rate.Limiter) (map[string]interface{}, error) {
 	cacheFile := fmt.Sprintf("%s_params.json.tmp", endpoint[1:])
 	logger.Printf("Fetching params for %s", endpoint)
-	if data, err := decompressFile(cacheFile); err == nil {
+	if data, err := ioutil.ReadFile(cacheFile); err == nil {
 		var params map[string]interface{}
 		if err := json.Unmarshal(data, &params); err == nil {
 			logger.Printf("Loaded cached params from %s", cacheFile)
@@ -381,83 +350,49 @@ func fetchParams(endpoint string, state *State, limiter *rate.Limiter) (map[stri
 	url := fmt.Sprintf("%s%s", REST_URL, endpoint)
 	resp, err := fetchWithRetry(url, state.BlockHeight, limiter)
 	if err != nil {
-		logger.Printf("Failed to fetch %s params: %v", endpoint, err)
+		logger.Printf("Failed to fetch params: %v", err)
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	var data map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		logger.Printf("JSON decode error for %s: %v", endpoint, err)
+		logger.Printf("JSON decode error: %v", err)
 		return nil, err
 	}
 	params, _ := data["params"].(map[string]interface{})
-	dataBytes, err := json.Marshal(params)
-	if err != nil {
-		logger.Printf("Failed to marshal %s params: %v", endpoint, err)
-	} else {
-		if err := compressAndWriteFile(cacheFile, dataBytes); err != nil {
-			logger.Printf("Failed to cache %s params: %v", endpoint, err)
-		} else {
-			logger.Printf("Cached %s params to %s", endpoint, cacheFile)
-		}
+	dataBytes, _ := json.Marshal(params)
+	if err := ioutil.WriteFile(cacheFile, dataBytes, 0644); err != nil {
+		logger.Printf("Failed to cache params: %v", err)
 	}
-	logger.Printf("Successfully fetched %s params", endpoint)
+	logger.Printf("Fetched params for %s", endpoint)
 	return params, nil
 }
 
-// compressAndWriteFile compresses data and writes it to a file.
-func compressAndWriteFile(filename string, data []byte) error {
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-	if _, err := gz.Write(data); err != nil {
-		return err
-	}
-	if err := gz.Close(); err != nil {
-		return err
-	}
-	return ioutil.WriteFile(filename, buf.Bytes(), 0644)
-}
-
-// decompressFile reads and decompresses a file.
-func decompressFile(filename string) ([]byte, error) {
-	data, err := ioutil.ReadFile(filename)
-	if err != nil {
-		return nil, err
-	}
-	r, err := gzip.NewReader(bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	defer r.Close()
-	return io.ReadAll(r)
-}
-
-// convertAddress converts a Bech32 address to a new prefix.
+// convertAddress converts a Bech32 address.
 func convertAddress(addr, oldPrefix, newPrefix string) (string, error) {
 	hrp, data, err := bech32.Decode(addr)
 	if err != nil {
-		logger.Printf("Failed to decode Bech32 address %s: %v", addr, err)
+		logger.Printf("Failed to decode %s: %v", addr, err)
 		return "", err
 	}
 	if !strings.HasPrefix(hrp, oldPrefix) {
-		logger.Printf("Address %s does not have prefix %s, skipping conversion", addr, oldPrefix)
 		return addr, nil
 	}
 	suffix := strings.TrimPrefix(hrp, oldPrefix)
 	newHRP := newPrefix + suffix
 	newAddr, err := bech32.Encode(newHRP, data)
 	if err != nil {
-		logger.Printf("Failed to encode Bech32 address %s with prefix %s: %v", addr, newPrefix, err)
+		logger.Printf("Failed to encode %s to %s: %v", addr, newPrefix, err)
 		return "", err
 	}
-	logger.Printf("Converted address %s to %s", addr, newAddr)
+	logger.Printf("Converted %s to %s", addr, newAddr)
 	return newAddr, nil
 }
 
-// convertAddresses updates all Bech32 addresses in the app state.
+// convertAddresses updates Bech32 addresses in the app state.
 func convertAddresses(appState map[string]interface{}, oldPrefix, newPrefix string) {
-	logger.Printf("Converting addresses from prefix %s to %s", oldPrefix, newPrefix)
+	logger.Printf("Converting addresses from %s to %s", oldPrefix, newPrefix)
 	convertField := func(m map[string]interface{}, key string) {
 		if val, ok := m[key].(string); ok {
 			if newVal, err := convertAddress(val, oldPrefix, newPrefix); err == nil {
@@ -497,7 +432,6 @@ func convertAddresses(appState map[string]interface{}, oldPrefix, newPrefix stri
 			}
 		}
 	}
-	logger.Println("Address conversion completed.")
 }
 
 // getLatestBlockHeight fetches the latest block height.
@@ -518,12 +452,12 @@ func getLatestBlockHeight(limiter *rate.Limiter) (int64, error) {
 		} `json:"block"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		logger.Printf("Failed to decode block height response: %v", err)
+		logger.Printf("Failed to decode block height: %v", err)
 		return 0, err
 	}
 	height, err := strconv.ParseInt(data.Block.Header.Height, 10, 64)
 	if err != nil {
-		logger.Printf("Failed to parse block height %s: %v", data.Block.Header.Height, err)
+		logger.Printf("Failed to parse height %s: %v", data.Block.Header.Height, err)
 		return 0, err
 	}
 	logger.Printf("Latest block height: %d", height)
@@ -531,27 +465,15 @@ func getLatestBlockHeight(limiter *rate.Limiter) (int64, error) {
 }
 
 func main() {
-	// Parse flags
 	var newPrefix string
-	flag.StringVar(&newPrefix, "prefix", "", "New Bech32 prefix for addresses (e.g., cosmos)")
+	flag.StringVar(&newPrefix, "prefix", "", "New Bech32 prefix (e.g., cosmos)")
 	flag.Parse()
-	logger.Printf("Starting with prefix argument: %s", newPrefix)
+	logger.Printf("Starting with prefix: %s", newPrefix)
 
-	// Adaptive rate limiter (starts at 500 req/s, adjusts based on runtime)
+	// Rate limiter: 500 req/s with burst
 	limiter := rate.NewLimiter(500, 1000)
-	go func() {
-		for range time.Tick(10 * time.Second) {
-			// Placeholder for dynamic adjustment (could use success rate or latency)
-			logger.Printf("Current rate limit: %v req/s", limiter.Limit())
-		}
-	}()
-
-	// Optimize worker count based on CPU cores with a cap
-	workers := runtime.NumCPU() * 4
-	if workers > 50 {
-		workers = 50
-	}
-	logger.Printf("Using %d workers based on %d CPU cores", workers, runtime.NumCPU())
+	const workers = 50
+	logger.Printf("Using %d workers", workers)
 
 	// Get block height
 	blockHeight, err := getLatestBlockHeight(limiter)
@@ -567,7 +489,7 @@ func main() {
 	}
 	state.BlockHeight = blockHeight
 
-	// Fetch all data concurrently
+	// Fetch data concurrently
 	var wg sync.WaitGroup
 	errChan := make(chan error, 10)
 	data := make(map[string][]map[string]interface{})
@@ -591,7 +513,6 @@ func main() {
 		wg.Add(1)
 		go func(e struct{ endpoint, key string }) {
 			defer wg.Done()
-			logger.Printf("Starting fetch for %s", e.key)
 			items, err := fetchAll(e.endpoint, e.key, state, workers, limiter)
 			if err != nil {
 				errChan <- fmt.Errorf("%s: %v", e.key, err)
@@ -605,7 +526,6 @@ func main() {
 		wg.Add(1)
 		go func(e string) {
 			defer wg.Done()
-			logger.Printf("Starting params fetch for %s", e)
 			p, err := fetchParams(e, state, limiter)
 			if err != nil {
 				errChan <- fmt.Errorf("%s: %v", e, err)
@@ -616,17 +536,15 @@ func main() {
 		}(e)
 	}
 
-	// Wait for completion
 	wg.Wait()
 	close(errChan)
 	for err := range errChan {
 		logger.Printf("Fetch error: %v", err)
 	}
 
-	// Fetch balances after accounts
+	// Fetch balances
 	accounts := data["accounts"]
 	if len(accounts) > 0 {
-		logger.Println("Fetching balances for accounts...")
 		balances, err := fetchBalances(accounts, state, workers, limiter)
 		if err != nil {
 			logger.Printf("Warning: Balances fetch failed: %v", err)
@@ -669,33 +587,31 @@ func main() {
 		},
 	}
 
-	// Handle Bech32 prefix conversion
+	// Handle Bech32 prefix
 	if newPrefix != "" {
-		logger.Printf("Applying Bech32 prefix conversion to %s", newPrefix)
+		logger.Printf("Converting to prefix %s", newPrefix)
 		oldPrefix := "sei"
 		if len(accounts) > 0 {
 			if addr, ok := accounts[0]["address"].(string); ok {
 				if hrp, _, err := bech32.Decode(addr); err == nil {
 					oldPrefix = hrp
-					logger.Printf("Detected old prefix: %s", oldPrefix)
 				}
 			}
 		}
 		convertAddresses(genesis["app_state"].(map[string]interface{}), oldPrefix, newPrefix)
 	}
 
-	// Write genesis file
+	// Write genesis
 	logger.Println("Writing genesis.json...")
 	genesisBytes, err := json.MarshalIndent(genesis, "", "  ")
 	if err != nil {
 		logger.Fatalf("Failed to marshal genesis: %v", err)
 	}
-	if err := compressAndWriteFile("genesis.json.tmp", genesisBytes); err != nil {
+	if err := ioutil.WriteFile("genesis.json.tmp", genesisBytes, 0644); err != nil {
 		logger.Fatalf("Failed to write genesis.json.tmp: %v", err)
 	}
 
-	// Rename temporary files
-	logger.Println("Renaming temporary files to final names...")
+	logger.Println("Renaming temporary files...")
 	for _, key := range append([]string{"accounts", "balances", "validators", "delegation_responses", "metadatas"}, paramEndpoints...) {
 		tmp := fmt.Sprintf("%s.json.tmp", key)
 		final := fmt.Sprintf("%s.json", key)

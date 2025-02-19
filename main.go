@@ -11,6 +11,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -655,14 +656,24 @@ func updateBalances(accounts []map[string]interface{}, height int64) ([]map[stri
 
 				// Only send non-zero balances
 				if len(balanceResp.Balances) > 0 {
+					// Log interesting balances (only worker 0, and only if significant)
+					if workerID == 0 {
+						for _, bal := range balanceResp.Balances {
+							if amount, ok := bal["amount"].(string); ok {
+								if amt, err := strconv.ParseInt(amount, 10, 64); err == nil {
+									if amt > 1000000 { // More than 1M uwunicorn
+										logger.Printf("Found large balance: %s has %s %s",
+											addr, amount, bal["denom"])
+									}
+								}
+							}
+						}
+					}
+
 					results <- map[string]interface{}{
 						"address": addr,
 						"coins":   balanceResp.Balances,
 					}
-				}
-
-				if workerID == 0 && len(balanceResp.Balances) > 0 {
-					logger.Printf("Sample balance for %s: %v", addr, balanceResp.Balances)
 				}
 			}
 			logger.Printf("Worker %d: Finished processing balances", workerID)
@@ -1103,6 +1114,101 @@ func findMissingAndNewAccounts(existingAccounts []map[string]interface{}) ([]int
 	return missingNums, nil
 }
 
+// Add this new function to generate the richlist
+func generateRichlist(balances []map[string]interface{}) error {
+	logger.Println("Generating richlist...")
+
+	type AccountBalance struct {
+		Address string `json:"address"`
+		Amount  int64  `json:"amount"`
+	}
+
+	var richlist []AccountBalance
+
+	// Convert balances to sorted list
+	for _, bal := range balances {
+		addr, ok := bal["address"].(string)
+		if !ok {
+			continue
+		}
+
+		coins, ok := bal["coins"].([]interface{})
+		if !ok {
+			continue
+		}
+
+		// Find uwunicorn balance
+		for _, coin := range coins {
+			coinMap, ok := coin.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			if denom, ok := coinMap["denom"].(string); ok && denom == "uwunicorn" {
+				if amountStr, ok := coinMap["amount"].(string); ok {
+					amount, err := strconv.ParseInt(amountStr, 10, 64)
+					if err != nil {
+						continue
+					}
+					if amount > 0 {
+						richlist = append(richlist, AccountBalance{
+							Address: addr,
+							Amount:  amount,
+						})
+					}
+				}
+			}
+		}
+	}
+
+	// Sort by amount descending
+	sort.Slice(richlist, func(i, j int) bool {
+		return richlist[i].Amount > richlist[j].Amount
+	})
+
+	// Add ranking and format for output
+	type RichlistEntry struct {
+		Rank    int    `json:"rank"`
+		Address string `json:"address"`
+		Amount  string `json:"amount"`
+		// Convert uwunicorn to UNICORN for readability
+		Unicorn string `json:"unicorn"`
+	}
+
+	var formattedList []RichlistEntry
+	for i, entry := range richlist {
+		formattedList = append(formattedList, RichlistEntry{
+			Rank:    i + 1,
+			Address: entry.Address,
+			Amount:  strconv.FormatInt(entry.Amount, 10),
+			Unicorn: strconv.FormatFloat(float64(entry.Amount)/1000000, 'f', 6, 64),
+		})
+	}
+
+	// Write richlist to file
+	if err := writeJSONFile("richlist.json", formattedList); err != nil {
+		return fmt.Errorf("failed to write richlist: %v", err)
+	}
+
+	logger.Printf("Generated richlist with %d entries", len(formattedList))
+	// Log top 10 for visibility
+	if len(formattedList) > 0 {
+		logger.Println("Top 10 balances:")
+		max := 10
+		if len(formattedList) < max {
+			max = len(formattedList)
+		}
+		for i := 0; i < max; i++ {
+			logger.Printf("#%d: %s - %s UNICORN",
+				formattedList[i].Rank,
+				formattedList[i].Address,
+				formattedList[i].Unicorn)
+		}
+	}
+
+	return nil
+}
+
 func main() {
 	logger.Println("=== Starting Unicorn Snapshot ===")
 	logger.Printf("Block height check...")
@@ -1204,6 +1310,14 @@ func main() {
 			}
 			data["balances"] = balances
 			logger.Printf("Using existing balances from height %d", state.BlockHeight)
+		}
+	}
+
+	// Generate richlist
+	if len(data["balances"]) > 0 {
+		logger.Println("=== Generating Richlist ===")
+		if err := generateRichlist(data["balances"]); err != nil {
+			logger.Printf("Warning: Failed to generate richlist: %v", err)
 		}
 	}
 

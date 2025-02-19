@@ -40,3 +40,6 @@ This software generates a cosmos-sdk v0.50.x compatible genesis.json file, which
 ## Purpose
 
 This frees the unicorn.
+
+
+Latest snapshot from block height: 11774453

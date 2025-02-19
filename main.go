@@ -87,25 +87,46 @@ func fetchWithRetry(url string, blockHeight int64, maxRetries int) (*http.Respon
 
 // fetchAll retrieves paginated data with resuming capability.
 func fetchAll(endpoint, itemsKey string, state *State) ([]map[string]interface{}, error) {
-	var allItems []map[string]interface{}
-	if _, err := os.Stat(itemsKey + ".json"); err == nil && state.CompletedAccounts {
+	var existingItems []map[string]interface{}
+	var lastAccountNum int64 = -1
+
+	// Load existing accounts if any
+	if _, err := os.Stat(itemsKey + ".json"); err == nil {
 		data, err := os.ReadFile(itemsKey + ".json")
 		if err == nil {
-			if err := json.Unmarshal(data, &allItems); err == nil {
-				fmt.Printf("Loaded %d %s from cache.\n", len(allItems), itemsKey)
-				return allItems, nil
+			if err := json.Unmarshal(data, &existingItems); err == nil {
+				fmt.Printf("Loaded %d existing %s from cache.\n", len(existingItems), itemsKey)
+				// Find highest account number
+				for _, item := range existingItems {
+					if itemsKey == "accounts" {
+						if num, ok := item["account_number"].(string); ok {
+							if n, err := strconv.ParseInt(num, 10, 64); err == nil && n > lastAccountNum {
+								lastAccountNum = n
+							}
+						}
+					}
+				}
 			}
 		}
 	}
 
-	// Get first page to determine total pages
+	// If we're fetching accounts and have existing ones, modify the endpoint to start after the last account
 	baseURL := fmt.Sprintf("%s%s", REST_URL, endpoint)
+	if itemsKey == "accounts" && lastAccountNum >= 0 {
+		baseURL = fmt.Sprintf("%s?pagination.reverse=false&account_number_gt=%d", baseURL, lastAccountNum)
+	}
+
+	// Get first page to determine total pages
 	params := url.Values{}
 	params.Add("pagination.limit", "100")
 	fullURL := fmt.Sprintf("%s?%s", baseURL, params.Encode())
 
 	resp, err := fetchWithRetry(fullURL, state.BlockHeight, 3)
 	if err != nil {
+		if itemsKey == "accounts" && len(existingItems) > 0 {
+			fmt.Printf("Failed to fetch new accounts, using %d existing accounts\n", len(existingItems))
+			return existingItems, nil
+		}
 		return nil, fmt.Errorf("failed to fetch first page: %v", err)
 	}
 	defer resp.Body.Close()
@@ -177,7 +198,7 @@ func fetchAll(endpoint, itemsKey string, state *State) ([]map[string]interface{}
 	}()
 
 	// Collect results
-	allItems = make([]map[string]interface{}, 0, total)
+	allItems := make([]map[string]interface{}, 0, total)
 	processed := 0
 	for result := range results {
 		processed++
@@ -198,6 +219,9 @@ func fetchAll(endpoint, itemsKey string, state *State) ([]map[string]interface{}
 			break
 		}
 	}
+
+	// When collecting results, append to existing items
+	allItems = append(existingItems, allItems...)
 
 	state.CompletedAccounts = true
 	saveState(state)

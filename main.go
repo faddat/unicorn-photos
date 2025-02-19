@@ -110,27 +110,99 @@ func fetchAll(endpoint, itemsKey string, state *State) ([]map[string]interface{}
 		}
 	}
 
-	// If we're fetching accounts and have existing ones, modify the endpoint to start after the last account
-	baseURL := fmt.Sprintf("%s%s", REST_URL, endpoint)
-	var fullURL string
-	if itemsKey == "accounts" && lastAccountNum >= 0 {
-		// Remove the pagination parameters from subsequent requests since we're using account_number_gt
-		baseURL = fmt.Sprintf("%s/cosmos/auth/v1beta1/accounts?account_number_gt=%d&pagination.limit=100", REST_URL, lastAccountNum)
+	// For accounts, use next key pagination to get all accounts
+	if itemsKey == "accounts" {
+		var allItems []map[string]interface{}
+		nextKey := ""
+		pageSize := 100
+		page := 0
 
-		// Don't append additional pagination parameters for accounts
-		fullURL = baseURL
-	} else {
-		params := url.Values{}
-		params.Add("pagination.limit", "100")
-		fullURL = fmt.Sprintf("%s?%s", baseURL, params.Encode())
+		for {
+			params := url.Values{}
+			params.Add("pagination.limit", fmt.Sprintf("%d", pageSize))
+			if nextKey != "" {
+				params.Add("pagination.key", nextKey)
+			}
+			fullURL := fmt.Sprintf("%s%s?%s", REST_URL, endpoint, params.Encode())
+
+			resp, err := fetchWithRetry(fullURL, state.BlockHeight, 3)
+			if err != nil {
+				if len(existingItems) > 0 {
+					fmt.Printf("Failed to fetch new accounts, using %d existing accounts\n", len(existingItems))
+					return existingItems, nil
+				}
+				return nil, fmt.Errorf("failed to fetch accounts: %v", err)
+			}
+
+			var data map[string]interface{}
+			if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+				resp.Body.Close()
+				return nil, fmt.Errorf("JSON decode error: %v", err)
+			}
+			resp.Body.Close()
+
+			items, ok := data[itemsKey].([]interface{})
+			if !ok {
+				return nil, fmt.Errorf("invalid response format")
+			}
+
+			pageItems := make([]map[string]interface{}, len(items))
+			for i, item := range items {
+				pageItems[i] = item.(map[string]interface{})
+			}
+			allItems = append(allItems, pageItems...)
+
+			// Save progress periodically
+			if page%10 == 0 {
+				fmt.Printf("Fetched %d accounts so far...\n", len(allItems))
+				dataBytes, _ := json.MarshalIndent(allItems, "", "  ")
+				os.WriteFile(itemsKey+".json", dataBytes, 0644)
+			}
+
+			// Check for next page
+			pagination, ok := data["pagination"].(map[string]interface{})
+			if !ok || pagination["next_key"] == nil {
+				break
+			}
+			nextKey = pagination["next_key"].(string)
+			page++
+		}
+
+		// Merge with existing accounts, removing duplicates
+		seen := make(map[string]bool)
+		merged := make([]map[string]interface{}, 0)
+
+		// Add existing accounts first
+		for _, item := range existingItems {
+			if addr, ok := item["address"].(string); ok {
+				seen[addr] = true
+				merged = append(merged, item)
+			}
+		}
+
+		// Add new accounts if they don't exist
+		for _, item := range allItems {
+			if addr, ok := item["address"].(string); ok {
+				if !seen[addr] {
+					seen[addr] = true
+					merged = append(merged, item)
+				}
+			}
+		}
+
+		fmt.Printf("Completed fetching %d total accounts (including %d existing).\n",
+			len(merged), len(existingItems))
+		return merged, nil
 	}
+
+	// For other endpoints, use the existing parallel fetching logic
+	baseURL := fmt.Sprintf("%s%s", REST_URL, endpoint)
+	params := url.Values{}
+	params.Add("pagination.limit", "100")
+	fullURL := fmt.Sprintf("%s?%s", baseURL, params.Encode())
 
 	resp, err := fetchWithRetry(fullURL, state.BlockHeight, 3)
 	if err != nil {
-		if itemsKey == "accounts" && len(existingItems) > 0 {
-			fmt.Printf("Failed to fetch new accounts, using %d existing accounts\n", len(existingItems))
-			return existingItems, nil
-		}
 		return nil, fmt.Errorf("failed to fetch first page: %v", err)
 	}
 	defer resp.Body.Close()
@@ -159,12 +231,6 @@ func fetchAll(endpoint, itemsKey string, state *State) ([]map[string]interface{}
 		return nil, fmt.Errorf("unexpected total type: %T", pagination["total"])
 	}
 
-	if total == 0 {
-		// No new items to fetch, return existing items
-		fmt.Printf("No new %s to fetch\n", itemsKey)
-		return existingItems, nil
-	}
-
 	pageSize := 100
 	numPages := (total + pageSize - 1) / pageSize
 
@@ -178,23 +244,13 @@ func fetchAll(endpoint, itemsKey string, state *State) ([]map[string]interface{}
 	workers := 50
 	jobs := make(chan int, numPages)
 	results := make(chan pageResult, numPages)
-	rateLimit := time.NewTicker(time.Millisecond * 20)
-	defer rateLimit.Stop()
 
 	// Start workers
 	for w := 0; w < workers; w++ {
 		go func() {
 			for page := range jobs {
-				<-rateLimit.C
-				var pageURL string
-				if itemsKey == "accounts" {
-					pageURL = fmt.Sprintf("%s/cosmos/auth/v1beta1/accounts?account_number_gt=%d&pagination.limit=%d",
-						REST_URL, lastAccountNum+(int64(page)*int64(pageSize)), pageSize)
-				} else {
-					pageURL = fmt.Sprintf("%s?pagination.limit=%d&pagination.offset=%d",
-						baseURL, pageSize, page*pageSize)
-				}
-
+				pageURL := fmt.Sprintf("%s?pagination.limit=%d&pagination.offset=%d",
+					baseURL, pageSize, page*pageSize)
 				resp, err := fetchWithRetry(pageURL, state.BlockHeight, 3)
 				if err != nil {
 					results <- pageResult{page: page, err: err}
@@ -243,20 +299,10 @@ func fetchAll(endpoint, itemsKey string, state *State) ([]map[string]interface{}
 		}
 		allItems = append(allItems, result.items...)
 
-		if processed%10 == 0 || processed == numPages {
-			fmt.Printf("Fetched %d/%d pages of %s\n", processed, numPages, itemsKey)
-			// Cache intermediate results
-			dataBytes, _ := json.MarshalIndent(allItems, "", "  ")
-			os.WriteFile(itemsKey+".json", dataBytes, 0644)
-		}
-
 		if processed >= numPages {
 			break
 		}
 	}
-
-	// When collecting results, append to existing items
-	allItems = append(existingItems, allItems...)
 
 	state.CompletedAccounts = true
 	saveState(state)

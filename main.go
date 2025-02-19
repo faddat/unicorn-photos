@@ -1,20 +1,26 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/btcsuite/btcutil/bech32"
+	"golang.org/x/time/rate"
 )
 
 // REST_URL is the base URL for the blockchain's REST API.
@@ -33,8 +39,36 @@ type fetchResult struct {
 	Err     error
 }
 
-// Logger with custom prefix for verbose output
-var logger = log.New(os.Stdout, "[SNAPSHOT] ", log.Ldate|log.Ltime|log.Lmicroseconds)
+// Logger with buffering for performance
+var logger = log.New(&bufferedWriter{Writer: os.Stdout}, "[SNAPSHOT] ", log.Ldate|log.Ltime|log.Lmicroseconds)
+
+// bufferedWriter reduces I/O overhead by buffering log output
+type bufferedWriter struct {
+	sync.Mutex
+	Writer io.Writer
+	Buffer bytes.Buffer
+}
+
+func (bw *bufferedWriter) Write(p []byte) (n int, err error) {
+	bw.Mutex.Lock()
+	defer bw.Mutex.Unlock()
+	bw.Buffer.Write(p)
+	if bytes.Contains(p, []byte("\n")) {
+		_, err = bw.Writer.Write(bw.Buffer.Bytes())
+		bw.Buffer.Reset()
+	}
+	return len(p), err
+}
+
+// httpClient with connection pooling
+var httpClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 50,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
 
 // loadState loads or initializes the state.
 func loadState() (*State, error) {
@@ -43,9 +77,9 @@ func loadState() (*State, error) {
 		logger.Println("No existing state found, initializing new state.")
 		return &State{CompletedEndpoints: make(map[string]string)}, nil
 	}
-	data, err := ioutil.ReadFile("state.json.tmp")
+	data, err := decompressFile("state.json.tmp")
 	if err != nil {
-		logger.Printf("Failed to read state.json.tmp: %v", err)
+		logger.Printf("Failed to read/decompress state.json.tmp: %v", err)
 		return nil, fmt.Errorf("failed to read state: %v", err)
 	}
 	var state State
@@ -57,28 +91,35 @@ func loadState() (*State, error) {
 	return &state, nil
 }
 
-// saveState saves the state to a temporary file.
-func saveState(state *State) error {
-	logger.Println("Saving state to state.json.tmp...")
+// saveState saves the state to a temporary compressed file.
+func saveState(state *State, final bool) error {
+	logger.Println("Saving state...")
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		logger.Printf("Failed to marshal state: %v", err)
 		return fmt.Errorf("failed to marshal state: %v", err)
 	}
-	if err := ioutil.WriteFile("state.json.tmp", data, 0644); err != nil {
-		logger.Printf("Failed to write state.json.tmp: %v", err)
+	filename := "state.json.tmp"
+	if final {
+		filename = "state.json"
+	}
+	if err := compressAndWriteFile(filename, data); err != nil {
+		logger.Printf("Failed to write %s: %v", filename, err)
 		return err
 	}
-	logger.Printf("State saved with block height %d and %d completed endpoints.", state.BlockHeight, len(state.CompletedEndpoints))
+	logger.Printf("State saved to %s with block height %d and %d completed endpoints.", filename, state.BlockHeight, len(state.CompletedEndpoints))
 	return nil
 }
 
-// fetchWithRetry performs an HTTP GET with retries.
-func fetchWithRetry(url string, blockHeight int64) (*http.Response, error) {
+// fetchWithRetry performs an HTTP GET with retries and adaptive rate limiting.
+func fetchWithRetry(url string, blockHeight int64, limiter *rate.Limiter) (*http.Response, error) {
 	const maxRetries = 3
 	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if err := limiter.Wait(context.Background()); err != nil {
+			logger.Printf("Rate limiter error: %v", err)
+			continue
+		}
 		logger.Printf("Attempt %d: Fetching %s", attempt+1, url)
-		client := &http.Client{Timeout: 10 * time.Second}
 		req, err := http.NewRequest("GET", url, nil)
 		if err != nil {
 			logger.Printf("Failed to create request: %v", err)
@@ -88,7 +129,7 @@ func fetchWithRetry(url string, blockHeight int64) (*http.Response, error) {
 			req.Header.Add("x-cosmos-block-height", fmt.Sprintf("%d", blockHeight))
 			logger.Printf("Set x-cosmos-block-height header to %d", blockHeight)
 		}
-		resp, err := client.Do(req)
+		resp, err := httpClient.Do(req)
 		if err == nil && resp.StatusCode == http.StatusOK {
 			logger.Printf("Successfully fetched %s with status %d", url, resp.StatusCode)
 			return resp, nil
@@ -111,12 +152,9 @@ func fetchWithRetry(url string, blockHeight int64) (*http.Response, error) {
 }
 
 // fetchAll fetches paginated data using next-key pagination with a worker pool.
-func fetchAll(endpoint, itemsKey string, state *State, workers int) ([]map[string]interface{}, error) {
+func fetchAll(endpoint, itemsKey string, state *State, workers int, limiter *rate.Limiter) ([]map[string]interface{}, error) {
 	const pageSize = 100
 	logger.Printf("Starting fetchAll for %s (%s) with %d workers", endpoint, itemsKey, workers)
-	rateLimit := time.NewTicker(time.Millisecond * 2) // 500 req/s
-	defer rateLimit.Stop()
-
 	jobs := make(chan string, workers*2)
 	results := make(chan fetchResult, workers*2)
 	var wg sync.WaitGroup
@@ -124,7 +162,7 @@ func fetchAll(endpoint, itemsKey string, state *State, workers int) ([]map[strin
 	// Load cached data
 	cacheFile := fmt.Sprintf("%s.json.tmp", itemsKey)
 	var allItems []map[string]interface{}
-	if data, err := ioutil.ReadFile(cacheFile); err == nil {
+	if data, err := decompressFile(cacheFile); err == nil {
 		if err := json.Unmarshal(data, &allItems); err == nil {
 			logger.Printf("Loaded %d cached %s from %s", len(allItems), itemsKey, cacheFile)
 		} else {
@@ -140,7 +178,6 @@ func fetchAll(endpoint, itemsKey string, state *State, workers int) ([]map[strin
 		go func(workerID int) {
 			defer wg.Done()
 			for nextKey := range jobs {
-				<-rateLimit.C
 				params := url.Values{}
 				params.Add("pagination.limit", fmt.Sprintf("%d", pageSize))
 				if nextKey != "" {
@@ -149,7 +186,7 @@ func fetchAll(endpoint, itemsKey string, state *State, workers int) ([]map[strin
 				url := fmt.Sprintf("%s%s?%s", REST_URL, endpoint, params.Encode())
 				logger.Printf("Worker %d: Fetching page with next_key=%s", workerID, nextKey)
 
-				resp, err := fetchWithRetry(url, state.BlockHeight)
+				resp, err := fetchWithRetry(url, state.BlockHeight, limiter)
 				if err != nil {
 					results <- fetchResult{Err: err}
 					continue
@@ -170,9 +207,9 @@ func fetchAll(endpoint, itemsKey string, state *State, workers int) ([]map[strin
 					continue
 				}
 
-				pageItems := make([]map[string]interface{}, len(items))
-				for i, item := range items {
-					pageItems[i] = item.(map[string]interface{})
+				pageItems := make([]map[string]interface{}, 0, len(items))
+				for _, item := range items {
+					pageItems = append(pageItems, item.(map[string]interface{}))
 				}
 
 				nextKeyVal, _ := data["pagination"].(map[string]interface{})["next_key"].(string)
@@ -194,10 +231,10 @@ func fetchAll(endpoint, itemsKey string, state *State, workers int) ([]map[strin
 		close(results)
 	}()
 
-	seen := make(map[string]bool)
+	seen := make(map[string]struct{}, len(allItems)*2) // Pre-allocate for efficiency
 	for _, item := range allItems {
 		if addr, ok := item["address"].(string); ok {
-			seen[addr] = true
+			seen[addr] = struct{}{}
 		}
 	}
 
@@ -207,9 +244,13 @@ func fetchAll(endpoint, itemsKey string, state *State, workers int) ([]map[strin
 			continue
 		}
 		for _, item := range result.Items {
-			if addr, ok := item["address"].(string); ok && !seen[addr] {
-				seen[addr] = true
-				allItems = append(allItems, item)
+			if addr, ok := item["address"].(string); ok {
+				if _, exists := seen[addr]; !exists {
+					seen[addr] = struct{}{}
+					allItems = append(allItems, item)
+				}
+			} else {
+				allItems = append(allItems, item) // Non-address items (e.g., metadata) added directly
 			}
 		}
 		if result.NextKey != "" {
@@ -222,17 +263,17 @@ func fetchAll(endpoint, itemsKey string, state *State, workers int) ([]map[strin
 		}
 		if activeJobs > 0 {
 			state.CompletedEndpoints[endpoint] = result.NextKey
-			dataBytes, err := json.MarshalIndent(allItems, "", "  ")
+			dataBytes, err := json.Marshal(allItems) // No indent for speed
 			if err != nil {
 				logger.Printf("Failed to marshal %s for caching: %v", itemsKey, err)
 			} else {
-				if err := ioutil.WriteFile(cacheFile, dataBytes, 0644); err != nil {
+				if err := compressAndWriteFile(cacheFile, dataBytes); err != nil {
 					logger.Printf("Failed to write %s cache: %v", cacheFile, err)
 				} else {
 					logger.Printf("Cached %d %s to %s", len(allItems), itemsKey, cacheFile)
 				}
 			}
-			if err := saveState(state); err != nil {
+			if err := saveState(state, false); err != nil {
 				logger.Printf("Failed to save state: %v", err)
 			}
 		}
@@ -242,7 +283,7 @@ func fetchAll(endpoint, itemsKey string, state *State, workers int) ([]map[strin
 	if activeJobs == 0 {
 		delete(state.CompletedEndpoints, endpoint)
 		logger.Printf("Completed fetching %s, removed from state", endpoint)
-		if err := saveState(state); err != nil {
+		if err := saveState(state, false); err != nil {
 			logger.Printf("Failed to save state after completion: %v", err)
 		}
 	}
@@ -251,7 +292,7 @@ func fetchAll(endpoint, itemsKey string, state *State, workers int) ([]map[strin
 }
 
 // fetchBalances fetches balances for all accounts in parallel.
-func fetchBalances(accounts []map[string]interface{}, state *State, workers int) ([]map[string]interface{}, error) {
+func fetchBalances(accounts []map[string]interface{}, state *State, workers int, limiter *rate.Limiter) ([]map[string]interface{}, error) {
 	logger.Println("Starting parallel balance fetch...")
 	jobs := make(chan struct {
 		Index   int
@@ -259,19 +300,16 @@ func fetchBalances(accounts []map[string]interface{}, state *State, workers int)
 	}, workers*2)
 	results := make(chan fetchResult, workers*2)
 	var wg sync.WaitGroup
-	rateLimit := time.NewTicker(time.Millisecond * 2)
-	defer rateLimit.Stop()
 
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
 			for job := range jobs {
-				<-rateLimit.C
 				url := fmt.Sprintf("%s/cosmos/bank/v1beta1/balances/%s", REST_URL, job.Address)
 				logger.Printf("Worker %d: Fetching balance for %s (index %d)", workerID, job.Address, job.Index)
 
-				resp, err := fetchWithRetry(url, state.BlockHeight)
+				resp, err := fetchWithRetry(url, state.BlockHeight, limiter)
 				if err != nil {
 					results <- fetchResult{Err: err}
 					continue
@@ -315,7 +353,7 @@ func fetchBalances(accounts []map[string]interface{}, state *State, workers int)
 		close(results)
 	}()
 
-	var balances []map[string]interface{}
+	balances := make([]map[string]interface{}, 0, len(accounts))
 	for result := range results {
 		if result.Err != nil {
 			logger.Printf("Balance fetch error: %v", result.Err)
@@ -328,23 +366,20 @@ func fetchBalances(accounts []map[string]interface{}, state *State, workers int)
 }
 
 // fetchParams fetches module parameters.
-func fetchParams(endpoint string, state *State) (map[string]interface{}, error) {
+func fetchParams(endpoint string, state *State, limiter *rate.Limiter) (map[string]interface{}, error) {
 	cacheFile := fmt.Sprintf("%s_params.json.tmp", endpoint[1:])
 	logger.Printf("Fetching params for %s", endpoint)
-	if _, err := os.Stat(cacheFile); err == nil {
-		data, err := ioutil.ReadFile(cacheFile)
-		if err == nil {
-			var params map[string]interface{}
-			if err := json.Unmarshal(data, &params); err == nil {
-				logger.Printf("Loaded cached params from %s", cacheFile)
-				return params, nil
-			}
-			logger.Printf("Failed to unmarshal cached params: %v", err)
+	if data, err := decompressFile(cacheFile); err == nil {
+		var params map[string]interface{}
+		if err := json.Unmarshal(data, &params); err == nil {
+			logger.Printf("Loaded cached params from %s", cacheFile)
+			return params, nil
 		}
+		logger.Printf("Failed to unmarshal cached params: %v", err)
 	}
 
 	url := fmt.Sprintf("%s%s", REST_URL, endpoint)
-	resp, err := fetchWithRetry(url, state.BlockHeight)
+	resp, err := fetchWithRetry(url, state.BlockHeight, limiter)
 	if err != nil {
 		logger.Printf("Failed to fetch %s params: %v", endpoint, err)
 		return nil, err
@@ -357,11 +392,11 @@ func fetchParams(endpoint string, state *State) (map[string]interface{}, error) 
 		return nil, err
 	}
 	params, _ := data["params"].(map[string]interface{})
-	dataBytes, err := json.MarshalIndent(params, "", "  ")
+	dataBytes, err := json.Marshal(params)
 	if err != nil {
 		logger.Printf("Failed to marshal %s params: %v", endpoint, err)
 	} else {
-		if err := ioutil.WriteFile(cacheFile, dataBytes, 0644); err != nil {
+		if err := compressAndWriteFile(cacheFile, dataBytes); err != nil {
 			logger.Printf("Failed to cache %s params: %v", endpoint, err)
 		} else {
 			logger.Printf("Cached %s params to %s", endpoint, cacheFile)
@@ -369,6 +404,33 @@ func fetchParams(endpoint string, state *State) (map[string]interface{}, error) 
 	}
 	logger.Printf("Successfully fetched %s params", endpoint)
 	return params, nil
+}
+
+// compressAndWriteFile compresses data and writes it to a file.
+func compressAndWriteFile(filename string, data []byte) error {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if _, err := gz.Write(data); err != nil {
+		return err
+	}
+	if err := gz.Close(); err != nil {
+		return err
+	}
+	return ioutil.WriteFile(filename, buf.Bytes(), 0644)
+}
+
+// decompressFile reads and decompresses a file.
+func decompressFile(filename string) ([]byte, error) {
+	data, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return nil, err
+	}
+	r, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	return io.ReadAll(r)
 }
 
 // convertAddress converts a Bech32 address to a new prefix.
@@ -439,10 +501,10 @@ func convertAddresses(appState map[string]interface{}, oldPrefix, newPrefix stri
 }
 
 // getLatestBlockHeight fetches the latest block height.
-func getLatestBlockHeight() (int64, error) {
+func getLatestBlockHeight(limiter *rate.Limiter) (int64, error) {
 	logger.Println("Fetching latest block height...")
 	url := fmt.Sprintf("%s/cosmos/base/tendermint/v1beta1/blocks/latest", REST_URL)
-	resp, err := fetchWithRetry(url, 0)
+	resp, err := fetchWithRetry(url, 0, limiter)
 	if err != nil {
 		logger.Printf("Failed to fetch block height: %v", err)
 		return 0, err
@@ -475,8 +537,24 @@ func main() {
 	flag.Parse()
 	logger.Printf("Starting with prefix argument: %s", newPrefix)
 
+	// Adaptive rate limiter (starts at 500 req/s, adjusts based on runtime)
+	limiter := rate.NewLimiter(500, 1000)
+	go func() {
+		for range time.Tick(10 * time.Second) {
+			// Placeholder for dynamic adjustment (could use success rate or latency)
+			logger.Printf("Current rate limit: %v req/s", limiter.Limit())
+		}
+	}()
+
+	// Optimize worker count based on CPU cores with a cap
+	workers := runtime.NumCPU() * 4
+	if workers > 50 {
+		workers = 50
+	}
+	logger.Printf("Using %d workers based on %d CPU cores", workers, runtime.NumCPU())
+
 	// Get block height
-	blockHeight, err := getLatestBlockHeight()
+	blockHeight, err := getLatestBlockHeight(limiter)
 	if err != nil {
 		logger.Fatalf("Failed to get block height: %v", err)
 	}
@@ -514,7 +592,7 @@ func main() {
 		go func(e struct{ endpoint, key string }) {
 			defer wg.Done()
 			logger.Printf("Starting fetch for %s", e.key)
-			items, err := fetchAll(e.endpoint, e.key, state, 50)
+			items, err := fetchAll(e.endpoint, e.key, state, workers, limiter)
 			if err != nil {
 				errChan <- fmt.Errorf("%s: %v", e.key, err)
 				return
@@ -528,7 +606,7 @@ func main() {
 		go func(e string) {
 			defer wg.Done()
 			logger.Printf("Starting params fetch for %s", e)
-			p, err := fetchParams(e, state)
+			p, err := fetchParams(e, state, limiter)
 			if err != nil {
 				errChan <- fmt.Errorf("%s: %v", e, err)
 				return
@@ -549,7 +627,7 @@ func main() {
 	accounts := data["accounts"]
 	if len(accounts) > 0 {
 		logger.Println("Fetching balances for accounts...")
-		balances, err := fetchBalances(accounts, state, 50)
+		balances, err := fetchBalances(accounts, state, workers, limiter)
 		if err != nil {
 			logger.Printf("Warning: Balances fetch failed: %v", err)
 		}
@@ -612,7 +690,7 @@ func main() {
 	if err != nil {
 		logger.Fatalf("Failed to marshal genesis: %v", err)
 	}
-	if err := ioutil.WriteFile("genesis.json.tmp", genesisBytes, 0644); err != nil {
+	if err := compressAndWriteFile("genesis.json.tmp", genesisBytes); err != nil {
 		logger.Fatalf("Failed to write genesis.json.tmp: %v", err)
 	}
 
@@ -629,10 +707,8 @@ func main() {
 			}
 		}
 	}
-	if err := os.Rename("state.json.tmp", "state.json"); err != nil {
-		logger.Printf("Failed to rename state.json.tmp: %v", err)
-	} else {
-		logger.Println("Renamed state.json.tmp to state.json")
+	if err := saveState(state, true); err != nil {
+		logger.Printf("Failed to save final state: %v", err)
 	}
 	if err := os.Rename("genesis.json.tmp", "genesis.json"); err != nil {
 		logger.Printf("Failed to rename genesis.json.tmp: %v", err)

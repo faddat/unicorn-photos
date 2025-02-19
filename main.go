@@ -428,6 +428,50 @@ func writeJSONFile(filename string, data interface{}) error {
 	return nil
 }
 
+// Add this function
+func validateAccounts(filename string) (bool, int64) {
+	logger.Printf("Validating %s...", filename)
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		logger.Printf("Could not read %s: %v", filename, err)
+		return false, -1
+	}
+
+	var accounts []map[string]interface{}
+	if err := json.Unmarshal(data, &accounts); err != nil {
+		logger.Printf("Could not parse %s: %v", filename, err)
+		return false, -1
+	}
+
+	if len(accounts) == 0 {
+		logger.Printf("No accounts found in %s", filename)
+		return false, -1
+	}
+
+	// Check account numbers are sequential
+	lastNum := int64(-1)
+	for i, acc := range accounts {
+		numStr, ok := acc["account_number"].(string)
+		if !ok {
+			logger.Printf("Account %d missing account_number", i)
+			return false, -1
+		}
+		num, err := strconv.ParseInt(numStr, 10, 64)
+		if err != nil {
+			logger.Printf("Invalid account_number at index %d: %s", i, numStr)
+			return false, -1
+		}
+		if lastNum != -1 && num != lastNum+1 {
+			logger.Printf("Non-sequential account numbers at index %d: %d -> %d", i, lastNum, num)
+			return false, -1
+		}
+		lastNum = num
+	}
+
+	logger.Printf("Validated %d accounts, last account number: %d", len(accounts), lastNum)
+	return true, lastNum
+}
+
 func main() {
 	var newPrefix string
 	flag.StringVar(&newPrefix, "prefix", "unicorn", "New Bech32 prefix (default: unicorn)")
@@ -456,50 +500,62 @@ func main() {
 	nextKey := ""
 	pageSize := 500
 
-	for {
-		url := accountsURL
-		if nextKey != "" {
-			url = fmt.Sprintf("%s?pagination.key=%s&pagination.limit=%d", accountsURL, nextKey, pageSize)
-		} else {
-			url = fmt.Sprintf("%s?pagination.limit=%d", accountsURL, pageSize)
-		}
-
-		resp, err := httpClient.Get(url)
+	if valid, lastNum := validateAccounts("accounts.json"); valid {
+		logger.Printf("Using existing accounts.json with %d accounts", lastNum+1)
+		data, err := os.ReadFile("accounts.json")
 		if err != nil {
-			logger.Printf("Failed to fetch accounts: %v", err)
-			break
+			logger.Fatalf("Failed to read accounts.json: %v", err)
 		}
-
-		var result struct {
-			Accounts   []map[string]interface{} `json:"accounts"`
-			Pagination struct {
-				NextKey string `json:"next_key"`
-				Total   string `json:"total"`
-			} `json:"pagination"`
+		if err := json.Unmarshal(data, &allAccounts); err != nil {
+			logger.Fatalf("Failed to parse accounts.json: %v", err)
 		}
-
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			resp.Body.Close()
-			logger.Printf("Failed to decode accounts: %v", err)
-			break
-		}
-		resp.Body.Close()
-
-		allAccounts = append(allAccounts, result.Accounts...)
-		logger.Printf("Fetched %d accounts (total: %d, expected: %s)",
-			len(result.Accounts), len(allAccounts), result.Pagination.Total)
-
-		// Save progress periodically
-		if len(allAccounts)%1000 == 0 {
-			if err := writeJSONFile("accounts.json", allAccounts); err != nil {
-				logger.Printf("Failed to save progress: %v", err)
+	} else {
+		// Proceed with fetching accounts...
+		for {
+			url := accountsURL
+			if nextKey != "" {
+				url = fmt.Sprintf("%s?pagination.key=%s&pagination.limit=%d", accountsURL, nextKey, pageSize)
+			} else {
+				url = fmt.Sprintf("%s?pagination.limit=%d", accountsURL, pageSize)
 			}
-		}
 
-		if result.Pagination.NextKey == "" {
-			break
+			resp, err := httpClient.Get(url)
+			if err != nil {
+				logger.Printf("Failed to fetch accounts: %v", err)
+				break
+			}
+
+			var result struct {
+				Accounts   []map[string]interface{} `json:"accounts"`
+				Pagination struct {
+					NextKey string `json:"next_key"`
+					Total   string `json:"total"`
+				} `json:"pagination"`
+			}
+
+			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+				resp.Body.Close()
+				logger.Printf("Failed to decode accounts: %v", err)
+				break
+			}
+			resp.Body.Close()
+
+			allAccounts = append(allAccounts, result.Accounts...)
+			logger.Printf("Fetched %d accounts (total: %d, expected: %s)",
+				len(result.Accounts), len(allAccounts), result.Pagination.Total)
+
+			// Save progress periodically
+			if len(allAccounts)%1000 == 0 {
+				if err := writeJSONFile("accounts.json", allAccounts); err != nil {
+					logger.Printf("Failed to save progress: %v", err)
+				}
+			}
+
+			if result.Pagination.NextKey == "" {
+				break
+			}
+			nextKey = result.Pagination.NextKey
 		}
-		nextKey = result.Pagination.NextKey
 	}
 
 	data["accounts"] = allAccounts

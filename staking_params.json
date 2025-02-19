@@ -1,0 +1,5 @@
+{
+  "bond_denom": "usei",
+  "max_validators": 100,
+  "unbonding_time": "1814400s"
+}

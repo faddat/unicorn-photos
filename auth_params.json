@@ -1,0 +1,4 @@
+{
+  "max_memo_characters": "256",
+  "tx_sig_limit": "7"
+}

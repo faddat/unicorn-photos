@@ -618,59 +618,104 @@ func shouldUpdateBalances(oldHeight, newHeight int64) bool {
 func updateBalances(accounts []map[string]interface{}, height int64) ([]map[string]interface{}, error) {
 	logger.Printf("Updating balances for %d accounts at height %d", len(accounts), height)
 
-	balances := make([]map[string]interface{}, 0)
-	for i, account := range accounts {
-		addr, ok := account["address"].(string)
-		if !ok {
-			continue
-		}
+	// Create channels for parallel processing
+	workers := 50
+	jobs := make(chan string, workers*2)
+	results := make(chan map[string]interface{}, workers*2)
 
-		// Get balance
-		url := fmt.Sprintf("https://rest.unicorn.meme/cosmos/bank/v1beta1/balances/%s", addr)
-		resp, err := fetchWithBackoff(url, 5)
-		if err != nil {
-			logger.Printf("Warning: Failed to get balance for %s: %v", addr, err)
-			continue
-		}
+	// Start workers
+	var wg sync.WaitGroup
+	logger.Printf("Starting %d balance fetch workers...", workers)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for addr := range jobs {
+				url := fmt.Sprintf("https://rest.unicorn.meme/cosmos/bank/v1beta1/balances/%s", addr)
+				resp, err := fetchWithBackoff(url, 3)
+				if err != nil {
+					logger.Printf("Worker %d: Failed to get balance for %s: %v", workerID, addr, err)
+					continue
+				}
 
-		var balanceResp struct {
-			Balances []map[string]interface{} `json:"balances"`
-		}
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			logger.Printf("Warning: Failed to read balance response for %s: %v", addr, err)
-			continue
-		}
+				var balanceResp struct {
+					Balances []map[string]interface{} `json:"balances"`
+				}
+				body, err := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if err != nil {
+					logger.Printf("Worker %d: Failed to read balance for %s: %v", workerID, addr, err)
+					continue
+				}
 
-		if err := json.Unmarshal(body, &balanceResp); err != nil {
-			logger.Printf("Warning: Failed to parse balance for %s: %v", addr, err)
-			continue
-		}
+				if err := json.Unmarshal(body, &balanceResp); err != nil {
+					logger.Printf("Worker %d: Failed to parse balance for %s: %v", workerID, addr, err)
+					continue
+				}
 
-		// Only add non-zero balances
-		for _, bal := range balanceResp.Balances {
-			balances = append(balances, map[string]interface{}{
-				"address": addr,
-				"coins":   []map[string]interface{}{bal},
-			})
-		}
+				// Only send non-zero balances
+				if len(balanceResp.Balances) > 0 {
+					results <- map[string]interface{}{
+						"address": addr,
+						"coins":   balanceResp.Balances,
+					}
+				}
 
-		if i > 0 && i%100 == 0 {
-			logger.Printf("Processed balances for %d/%d accounts", i, len(accounts))
-			// Save progress periodically
+				if workerID == 0 && len(balanceResp.Balances) > 0 {
+					logger.Printf("Sample balance for %s: %v", addr, balanceResp.Balances)
+				}
+			}
+			logger.Printf("Worker %d: Finished processing balances", workerID)
+		}(w)
+	}
+
+	// Send jobs
+	go func() {
+		logger.Printf("Queueing %d addresses for balance fetch...", len(accounts))
+		for _, acc := range accounts {
+			if addr, ok := acc["address"].(string); ok {
+				jobs <- addr
+			}
+		}
+		close(jobs)
+
+		// Wait for all workers to finish
+		wg.Wait()
+		close(results)
+		logger.Println("All balance workers completed")
+	}()
+
+	// Collect results
+	var balances []map[string]interface{}
+	processed := 0
+	lastSave := time.Now()
+
+	logger.Println("Starting to collect balance results...")
+	for balance := range results {
+		balances = append(balances, balance)
+		processed++
+
+		// Save progress every minute
+		if time.Since(lastSave) > time.Minute {
+			logger.Printf("Saving intermediate balances (%d so far)...", len(balances))
 			if err := writeJSONFile("balances.json", balances); err != nil {
 				logger.Printf("Warning: Failed to save balance progress: %v", err)
 			}
+			lastSave = time.Now()
+		}
+
+		if processed%1000 == 0 {
+			logger.Printf("Processed %d/%d balances (%.2f%%)",
+				processed, len(accounts), float64(processed)/float64(len(accounts))*100)
 		}
 	}
 
-	// Always write final balances file
+	// Final save
 	if err := writeJSONFile("balances.json", balances); err != nil {
-		return nil, fmt.Errorf("failed to write balances: %v", err)
+		return nil, fmt.Errorf("failed to write final balances: %v", err)
 	}
 
-	logger.Printf("Updated balances.json with %d balance entries", len(balances))
+	logger.Printf("Completed balance update: %d total balances", len(balances))
 	return balances, nil
 }
 
@@ -981,6 +1026,83 @@ func fetchAccountsParallel() ([]map[string]interface{}, error) {
 	return nil, fmt.Errorf("failed to read final accounts file")
 }
 
+// Add this function to check for new accounts
+func checkForNewAccounts(lastKnownNum int64) (int64, error) {
+	logger.Println("Checking for new accounts...")
+	testURL := "https://rest.unicorn.meme/cosmos/auth/v1beta1/accounts?pagination.limit=1&pagination.offset=999999"
+	resp, err := httpClient.Get(testURL)
+	if err != nil {
+		return lastKnownNum, fmt.Errorf("failed to check for new accounts: %v", err)
+	}
+
+	var testResp struct {
+		Accounts []map[string]interface{} `json:"accounts"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&testResp); err != nil {
+		resp.Body.Close()
+		return lastKnownNum, fmt.Errorf("failed to decode response: %v", err)
+	}
+	resp.Body.Close()
+
+	if len(testResp.Accounts) > 0 {
+		if numStr, ok := testResp.Accounts[0]["account_number"].(string); ok {
+			if num, err := strconv.ParseInt(numStr, 10, 64); err == nil {
+				if num > lastKnownNum {
+					logger.Printf("Found new accounts: last known %d, current last %d", lastKnownNum, num)
+					return num, nil
+				}
+			}
+		}
+	}
+
+	return lastKnownNum, nil
+}
+
+func findMissingAndNewAccounts(existingAccounts []map[string]interface{}) ([]int64, error) {
+	logger.Println("Analyzing account gaps and checking for new accounts...")
+
+	// Create map of existing account numbers
+	accountMap := make(map[int64]bool)
+	var maxExisting int64 = -1
+
+	for _, acc := range existingAccounts {
+		if numStr, ok := acc["account_number"].(string); ok {
+			if num, err := strconv.ParseInt(numStr, 10, 64); err == nil {
+				accountMap[num] = true
+				if num > maxExisting {
+					maxExisting = num
+				}
+			}
+		}
+	}
+
+	// Check for new accounts beyond our highest
+	currentLast, err := checkForNewAccounts(maxExisting)
+	if err != nil {
+		logger.Printf("Warning: Failed to check for new accounts: %v", err)
+		currentLast = maxExisting
+	}
+
+	// Find all missing numbers from 0 to currentLast
+	var missingNums []int64
+	for i := int64(0); i <= currentLast; i++ {
+		if !accountMap[i] {
+			missingNums = append(missingNums, i)
+		}
+	}
+
+	if len(missingNums) > 0 {
+		logger.Printf("Found %d missing account numbers", len(missingNums))
+		if len(missingNums) < 10 {
+			logger.Printf("Missing accounts: %v", missingNums)
+		} else {
+			logger.Printf("First 10 missing accounts: %v...", missingNums[:10])
+		}
+	}
+
+	return missingNums, nil
+}
+
 func main() {
 	logger.Println("=== Starting Unicorn Snapshot ===")
 	logger.Printf("Block height check...")
@@ -1024,22 +1146,41 @@ func main() {
 	var accounts []map[string]interface{}
 
 	// Fetch accounts via REST
-	if valid, lastNum := validateAccounts("accounts.json"); valid {
-		logger.Printf("Using existing accounts.json with %d accounts", lastNum+1)
-		fileData, err := os.ReadFile("accounts.json")
-		if err != nil {
-			logger.Fatalf("Failed to read accounts.json: %v", err)
-		}
+	if fileData, err := os.ReadFile("accounts.json"); err == nil {
+		// Load existing accounts
 		if err := json.Unmarshal(fileData, &accounts); err != nil {
 			logger.Fatalf("Failed to parse accounts.json: %v", err)
 		}
-		data["accounts"] = accounts
+		logger.Printf("Loaded %d existing accounts", len(accounts))
+
+		// Find missing and new accounts
+		missingNums, err := findMissingAndNewAccounts(accounts)
+		if err != nil {
+			logger.Printf("Warning: Error checking for missing accounts: %v", err)
+		} else if len(missingNums) > 0 {
+			logger.Printf("Fetching %d missing accounts...", len(missingNums))
+			newAccounts, err := fetchMissingAccounts(missingNums, latestHeight)
+			if err != nil {
+				logger.Printf("Warning: Failed to fetch missing accounts: %v", err)
+			} else {
+				accounts = append(accounts, newAccounts...)
+				logger.Printf("Added %d new/missing accounts", len(newAccounts))
+
+				// Save updated accounts
+				if err := writeJSONFile("accounts.json", accounts); err != nil {
+					logger.Printf("Warning: Failed to save updated accounts: %v", err)
+				}
+			}
+		} else {
+			logger.Println("No missing or new accounts found")
+		}
 	} else {
+		// No existing accounts.json, fetch everything
+		logger.Println("No existing accounts.json, fetching all accounts...")
 		accounts, err = fetchAccountsParallel()
 		if err != nil {
 			logger.Fatalf("Failed to fetch accounts: %v", err)
 		}
-		data["accounts"] = accounts
 	}
 
 	// Process accounts

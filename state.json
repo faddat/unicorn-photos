@@ -1,3 +1,9 @@
 {
-  "block_height": 11776820
+  "block_height": 11777458,
+  "accounts_complete": true,
+  "balances_complete": true,
+  "validators_complete": true,
+  "last_complete_height": 11777416,
+  "last_incomplete_height": 11777185,
+  "in_progress_files": null
 }

@@ -110,63 +110,110 @@ func fetchAll(endpoint, itemsKey string, state *State) ([]map[string]interface{}
 		}
 	}
 
-	// For accounts, use next key pagination to get all accounts
+	// For accounts, use parallel fetching with next-key pagination
 	if itemsKey == "accounts" {
-		var allItems []map[string]interface{}
-		nextKey := ""
-		pageSize := 100
-		page := 0
+		workers := 50
+		pageSize := 100 // Reduced from 500 to 100
 
-		for {
-			params := url.Values{}
-			params.Add("pagination.limit", fmt.Sprintf("%d", pageSize))
-			if nextKey != "" {
-				params.Add("pagination.key", nextKey)
-			}
-			fullURL := fmt.Sprintf("%s%s?%s", REST_URL, endpoint, params.Encode())
-
-			resp, err := fetchWithRetry(fullURL, state.BlockHeight, 3)
-			if err != nil {
-				if len(existingItems) > 0 {
-					fmt.Printf("Failed to fetch new accounts, using %d existing accounts\n", len(existingItems))
-					return existingItems, nil
-				}
-				return nil, fmt.Errorf("failed to fetch accounts: %v", err)
-			}
-
-			var data map[string]interface{}
-			if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-				resp.Body.Close()
-				return nil, fmt.Errorf("JSON decode error: %v", err)
-			}
-			resp.Body.Close()
-
-			items, ok := data[itemsKey].([]interface{})
-			if !ok {
-				return nil, fmt.Errorf("invalid response format")
-			}
-
-			pageItems := make([]map[string]interface{}, len(items))
-			for i, item := range items {
-				pageItems[i] = item.(map[string]interface{})
-			}
-			allItems = append(allItems, pageItems...)
-
-			// Save progress periodically
-			if page%10 == 0 {
-				fmt.Printf("Fetched %d accounts so far...\n", len(allItems))
-				dataBytes, _ := json.MarshalIndent(allItems, "", "  ")
-				os.WriteFile(itemsKey+".json", dataBytes, 0644)
-			}
-
-			// Check for next page
-			pagination, ok := data["pagination"].(map[string]interface{})
-			if !ok || pagination["next_key"] == nil {
-				break
-			}
-			nextKey = pagination["next_key"].(string)
-			page++
+		type accountPage struct {
+			items   []map[string]interface{}
+			nextKey string
+			err     error
 		}
+
+		jobs := make(chan string, workers*2) // Buffer for next keys
+		results := make(chan accountPage, workers*2)
+		rateLimit := time.NewTicker(time.Millisecond * 20)
+		defer rateLimit.Stop()
+
+		// Start workers
+		for w := 0; w < workers; w++ {
+			go func() {
+				for nextKey := range jobs {
+					<-rateLimit.C
+					params := url.Values{}
+					params.Add("pagination.limit", fmt.Sprintf("%d", pageSize))
+					if nextKey != "" {
+						params.Add("pagination.key", nextKey)
+					}
+					fullURL := fmt.Sprintf("%s%s?%s", REST_URL, endpoint, params.Encode())
+
+					resp, err := fetchWithRetry(fullURL, state.BlockHeight, 3)
+					if err != nil {
+						results <- accountPage{err: err}
+						continue
+					}
+
+					var data map[string]interface{}
+					if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+						resp.Body.Close()
+						results <- accountPage{err: err}
+						continue
+					}
+					resp.Body.Close()
+
+					items, ok := data[itemsKey].([]interface{})
+					if !ok {
+						results <- accountPage{err: fmt.Errorf("invalid response format")}
+						continue
+					}
+
+					pageItems := make([]map[string]interface{}, len(items))
+					for i, item := range items {
+						pageItems[i] = item.(map[string]interface{})
+					}
+
+					pagination := data["pagination"].(map[string]interface{})
+					var nextPageKey string
+					if pagination["next_key"] != nil {
+						nextPageKey = pagination["next_key"].(string)
+					}
+
+					results <- accountPage{
+						items:   pageItems,
+						nextKey: nextPageKey,
+					}
+				}
+			}()
+		}
+
+		// Start with empty next key
+		jobs <- ""
+		activeJobs := 1
+
+		// Process results and queue new jobs
+		var allItems []map[string]interface{}
+		processed := 0
+		saveInterval := time.NewTicker(time.Second * 5)
+		defer saveInterval.Stop()
+
+		for activeJobs > 0 {
+			select {
+			case result := <-results: // Fixed: changed 'range' to direct channel receive
+				activeJobs--
+				processed++
+
+				if result.err != nil {
+					fmt.Printf("Warning: Failed to fetch accounts page: %v\n", result.err)
+					continue
+				}
+
+				allItems = append(allItems, result.items...)
+				fmt.Printf("Fetched %d accounts so far...\n", len(allItems))
+
+				if result.nextKey != "" {
+					jobs <- result.nextKey
+					activeJobs++
+				}
+
+			case <-saveInterval.C:
+				if len(allItems) > 0 {
+					dataBytes, _ := json.MarshalIndent(allItems, "", "  ")
+					os.WriteFile(itemsKey+".json", dataBytes, 0644)
+				}
+			}
+		}
+		close(jobs)
 
 		// Merge with existing accounts, removing duplicates
 		seen := make(map[string]bool)

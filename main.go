@@ -487,33 +487,29 @@ func ensureSnapshotDir(height int64) (string, error) {
 	return dirPath, nil
 }
 
-// Modify writeJSONFile to use snapshot directory
-func writeJSONFile(filename string, data interface{}, snapshotDir string) error {
-	fullPath := filepath.Join(snapshotDir, filename)
+// Update writeJSONFile to properly handle temp files and commits
+func writeJSONFile(filename string, data interface{}, dir string) error {
+	fullPath := filepath.Join(dir, filename)
+	tempPath := fullPath + ".tmp"
 
-	// For accounts, write directly
-	if filename == "accounts.json" {
-		sortedJSON, err := json.MarshalIndent(data, "", "  ")
-		if err != nil {
-			return fmt.Errorf("marshal failed: %v", err)
-		}
-		if err := os.WriteFile(fullPath, sortedJSON, 0644); err != nil {
-			return fmt.Errorf("write failed: %v", err)
-		}
-		logger.Printf("Wrote %s", fullPath)
-		return nil
-	}
-
-	// For other files, use temp file
-	tempFile := fullPath + ".tmp"
-	sortedJSON, err := json.MarshalIndent(data, "", "  ")
+	// Marshal with indentation for readability
+	jsonData, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
-		return fmt.Errorf("marshal failed: %v", err)
+		return fmt.Errorf("failed to marshal JSON: %v", err)
 	}
-	if err := os.WriteFile(tempFile, sortedJSON, 0644); err != nil {
-		return fmt.Errorf("write failed: %v", err)
+
+	// Write to temp file first
+	if err := os.WriteFile(tempPath, jsonData, 0644); err != nil {
+		return fmt.Errorf("failed to write temp file: %v", err)
 	}
-	logger.Printf("Wrote temporary file %s", tempFile)
+	logger.Printf("Wrote temporary file %s", tempPath)
+
+	// Commit by renaming temp file to final file
+	if err := os.Rename(tempPath, fullPath); err != nil {
+		return fmt.Errorf("failed to commit file: %v", err)
+	}
+	logger.Printf("Committed file %s", fullPath)
+
 	return nil
 }
 
@@ -830,7 +826,7 @@ func updateBalances(accounts []map[string]interface{}, height int64, snapshotDir
 	return balances, nil
 }
 
-// Update generateRichlist to use total balances
+// Update generateRichlist to include both liquid and staked balances
 func generateRichlist(balances []TotalBalance, snapshotDir string) error {
 	logger.Println("Generating richlist...")
 
@@ -841,49 +837,71 @@ func generateRichlist(balances []TotalBalance, snapshotDir string) error {
 		return iTotal > jTotal
 	})
 
-	// Add ranking
+	// Add ranking and filter out zero balances
 	type RichlistEntry struct {
-		Rank          int    `json:"rank"`
-		Address       string `json:"address"`
-		LiquidAmount  string `json:"liquid_amount"`
-		StakedAmount  string `json:"staked_amount"`
-		TotalAmount   string `json:"total_amount"`
-		LiquidUnicorn string `json:"liquid_unicorn"`
-		StakedUnicorn string `json:"staked_unicorn"`
-		TotalUnicorn  string `json:"total_amount"`
+		Rank          int     `json:"rank"`
+		Address       string  `json:"address"`
+		LiquidAmount  string  `json:"liquid_amount"`
+		StakedAmount  string  `json:"staked_amount"`
+		TotalAmount   string  `json:"total_amount"`
+		LiquidUnicorn float64 `json:"liquid_unicorn"`
+		StakedUnicorn float64 `json:"staked_unicorn"`
+		TotalUnicorn  float64 `json:"total_unicorn"`
+		Percentage    float64 `json:"percentage_of_supply"`
 	}
 
 	var richlist []RichlistEntry
-	for i, balance := range balances {
-		richlist = append(richlist, RichlistEntry{
-			Rank:          i + 1,
-			Address:       balance.Address,
-			LiquidAmount:  balance.Liquid,
-			StakedAmount:  balance.Staked,
-			TotalAmount:   balance.Total,
-			LiquidUnicorn: balance.LiquidUnicorn,
-			StakedUnicorn: balance.StakedUnicorn,
-			TotalUnicorn:  balance.TotalUnicorn,
-		})
+	var totalSupply int64
+
+	// Calculate total supply first
+	for _, balance := range balances {
+		total, _ := strconv.ParseInt(balance.Total, 10, 64)
+		totalSupply += total
 	}
 
-	// Write richlist to file
+	// Create richlist entries with percentages
+	for i, balance := range balances {
+		total, _ := strconv.ParseInt(balance.Total, 10, 64)
+		if total > 0 { // Only include non-zero balances
+			liquid, _ := strconv.ParseFloat(balance.LiquidUnicorn, 64)
+			staked, _ := strconv.ParseFloat(balance.StakedUnicorn, 64)
+			totalUnicorn := liquid + staked
+			percentage := float64(total) / float64(totalSupply) * 100
+
+			richlist = append(richlist, RichlistEntry{
+				Rank:          i + 1,
+				Address:       balance.Address,
+				LiquidAmount:  balance.Liquid,
+				StakedAmount:  balance.Staked,
+				TotalAmount:   balance.Total,
+				LiquidUnicorn: liquid,
+				StakedUnicorn: staked,
+				TotalUnicorn:  totalUnicorn,
+				Percentage:    percentage,
+			})
+		}
+	}
+
+	// Write richlist to snapshot directory
 	if err := writeJSONFile("richlist.json", richlist, snapshotDir); err != nil {
 		return fmt.Errorf("failed to write richlist: %v", err)
 	}
 
+	// Log some statistics
 	logger.Printf("Generated richlist with %d entries", len(richlist))
 	if len(richlist) > 0 {
-		logger.Println("Top 10 total balances:")
+		logger.Printf("Total supply: %.6f UNICORN", float64(totalSupply)/1000000)
+		logger.Println("Top 10 balances:")
 		max := 10
 		if len(richlist) < max {
 			max = len(richlist)
 		}
 		for i := 0; i < max; i++ {
-			logger.Printf("#%d: %s - %s UNICORN (Liquid: %s, Staked: %s)",
+			logger.Printf("#%d: %s - %.6f UNICORN (%.2f%%) (Liquid: %.6f, Staked: %.6f)",
 				richlist[i].Rank,
 				richlist[i].Address,
 				richlist[i].TotalUnicorn,
+				richlist[i].Percentage,
 				richlist[i].LiquidUnicorn,
 				richlist[i].StakedUnicorn)
 		}
@@ -1153,6 +1171,10 @@ func main() {
 		if err != nil {
 			logger.Printf("Warning: %s params fetch failed: %v", module, err)
 		}
+		// Write each module's params to the snapshot directory
+		if err := writeJSONFile(fmt.Sprintf("%s_params.json", module), params[module], snapshotDir); err != nil {
+			logger.Printf("Warning: Failed to write %s params to snapshot: %v", module, err)
+		}
 	}
 
 	// Construct genesis
@@ -1195,25 +1217,13 @@ func main() {
 	logger.Printf("Converting from prefix '%s' to '%s'", oldPrefix, newPrefix)
 	convertAddresses(genesis["app_state"].(map[string]interface{}), oldPrefix, newPrefix)
 
-	// Write genesis
-	logger.Println("=== Writing Output Files ===")
-	for _, key := range []string{"accounts", "balances", "validators", "delegations", "metadatas"} {
-		if data[key] != nil {
-			logger.Printf("Writing %s.json (%d entries)...", key, len(data[key]))
-			if err := writeJSONFile(key+".json", data[key], snapshotDir); err != nil {
-				logger.Printf("Warning: write %s failed: %v", key, err)
-			}
-		}
+	// Write genesis to snapshot directory only
+	logger.Println("Writing genesis.json to snapshot directory...")
+	if err := writeJSONFile("genesis.json", genesis, snapshotDir); err != nil {
+		logger.Printf("Warning: Failed to write genesis.json to snapshot: %v", err)
 	}
 
-	logger.Println("Writing parameter files...")
-	for module, moduleParams := range params {
-		logger.Printf("Writing %s_params.json...", module)
-		if err := writeJSONFile(module+"_params.json", moduleParams, snapshotDir); err != nil {
-			logger.Printf("Warning: write %s params failed: %v", module, err)
-		}
-	}
-
+	// After constructing the genesis file, add:
 	// After fetching balances, save state again
 	if err := saveState(state, true, snapshotDir); err != nil {
 		logger.Printf("Failed to save final state: %v", err)

@@ -376,20 +376,47 @@ func getDefaultParams(endpoint string) map[string]interface{} {
 	}
 }
 
-// getLatestBlockHeight fetches the latest block height
+// Update getLatestBlockHeight to add REST fallback
 func getLatestBlockHeight() (int64, error) {
+	// Try RPC first
 	rpcParams, err := rpcQuery("block", map[string]interface{}{})
-	if err != nil {
-		return 0, err
+	if err == nil {
+		block := rpcParams["block"].(map[string]interface{})
+		header := block["header"].(map[string]interface{})
+		heightStr := header["height"].(string)
+		height, err := strconv.ParseInt(heightStr, 10, 64)
+		if err == nil {
+			logger.Printf("Latest block height from RPC: %d", height)
+			return height, nil
+		}
 	}
-	block := rpcParams["block"].(map[string]interface{})
-	header := block["header"].(map[string]interface{})
-	heightStr := header["height"].(string)
-	height, err := strconv.ParseInt(heightStr, 10, 64)
+
+	// Fallback to REST API
+	logger.Printf("RPC failed (%v), trying REST API...", err)
+	resp, err := httpClient.Get("https://rest.unicorn.meme/cosmos/base/tendermint/v1beta1/blocks/latest")
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("both RPC and REST failed: %v", err)
 	}
-	logger.Printf("Latest block height: %d", height)
+	defer resp.Body.Close()
+
+	var result struct {
+		Block struct {
+			Header struct {
+				Height string `json:"height"`
+			} `json:"header"`
+		} `json:"block"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return 0, fmt.Errorf("failed to decode REST response: %v", err)
+	}
+
+	height, err := strconv.ParseInt(result.Block.Header.Height, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse height: %v", err)
+	}
+
+	logger.Printf("Latest block height from REST: %d", height)
 	return height, nil
 }
 
@@ -700,7 +727,7 @@ func updateBalances(accounts []map[string]interface{}, height int64, snapshotDir
 	}
 
 	// Create buffered channels
-	workers := 150
+	workers := 100
 	bufferSize := len(accounts)
 	jobs := make(chan string, bufferSize)
 	results := make(chan map[string]interface{}, bufferSize)
@@ -1260,7 +1287,7 @@ func fetchAccountsParallel() ([]map[string]interface{}, error) {
 	logger.Println("Starting parallel account fetch...")
 
 	// Create channels for parallel processing
-	workers := 1600
+	workers := 200
 	jobs := make(chan int64, workers*2)
 	results := make(chan map[string]interface{}, workers*2)
 

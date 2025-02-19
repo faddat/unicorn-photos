@@ -112,14 +112,18 @@ func fetchAll(endpoint, itemsKey string, state *State) ([]map[string]interface{}
 
 	// If we're fetching accounts and have existing ones, modify the endpoint to start after the last account
 	baseURL := fmt.Sprintf("%s%s", REST_URL, endpoint)
+	var fullURL string
 	if itemsKey == "accounts" && lastAccountNum >= 0 {
-		baseURL = fmt.Sprintf("%s?pagination.reverse=false&account_number_gt=%d", baseURL, lastAccountNum)
-	}
+		// Remove the pagination parameters from subsequent requests since we're using account_number_gt
+		baseURL = fmt.Sprintf("%s/cosmos/auth/v1beta1/accounts?account_number_gt=%d&pagination.limit=100", REST_URL, lastAccountNum)
 
-	// Get first page to determine total pages
-	params := url.Values{}
-	params.Add("pagination.limit", "100")
-	fullURL := fmt.Sprintf("%s?%s", baseURL, params.Encode())
+		// Don't append additional pagination parameters for accounts
+		fullURL = baseURL
+	} else {
+		params := url.Values{}
+		params.Add("pagination.limit", "100")
+		fullURL = fmt.Sprintf("%s?%s", baseURL, params.Encode())
+	}
 
 	resp, err := fetchWithRetry(fullURL, state.BlockHeight, 3)
 	if err != nil {
@@ -176,7 +180,17 @@ func fetchAll(endpoint, itemsKey string, state *State) ([]map[string]interface{}
 		go func() {
 			for page := range jobs {
 				<-rateLimit.C
-				pageURL := fmt.Sprintf("%s?pagination.limit=%d&pagination.offset=%d", baseURL, pageSize, page*pageSize)
+				var pageURL string
+				if itemsKey == "accounts" {
+					// For accounts, increment the account_number_gt parameter
+					pageURL = fmt.Sprintf("%s/cosmos/auth/v1beta1/accounts?account_number_gt=%d&pagination.limit=%d",
+						REST_URL, lastAccountNum+(int64(page)*int64(pageSize)), pageSize)
+				} else {
+					// For other endpoints, use offset-based pagination
+					pageURL = fmt.Sprintf("%s?pagination.limit=%d&pagination.offset=%d",
+						baseURL, pageSize, page*pageSize)
+				}
+
 				resp, err := fetchWithRetry(pageURL, state.BlockHeight, 3)
 				if err != nil {
 					results <- pageResult{page: page, err: err}

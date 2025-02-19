@@ -492,7 +492,7 @@ func fetchMissingAccounts(missingNums []int64, height int64) ([]map[string]inter
 	return accounts, nil
 }
 
-// Modify processAccounts to fetch missing accounts
+// Modify processAccounts to be more resilient
 func processAccounts(accounts []map[string]interface{}) ([]map[string]interface{}, error) {
 	if len(accounts) == 0 {
 		return nil, fmt.Errorf("no accounts to process")
@@ -502,13 +502,16 @@ func processAccounts(accounts []map[string]interface{}) ([]map[string]interface{
 	accountMap := make(map[int64]map[string]interface{})
 	var maxAccNum int64 = -1
 
+	// First pass: collect valid accounts and find max account number
 	for _, acc := range accounts {
 		numStr, ok := acc["account_number"].(string)
 		if !ok {
+			logger.Printf("Warning: account missing account_number: %v", acc)
 			continue
 		}
 		num, err := strconv.ParseInt(numStr, 10, 64)
 		if err != nil {
+			logger.Printf("Warning: invalid account_number: %s", numStr)
 			continue
 		}
 		accountMap[num] = acc
@@ -516,6 +519,8 @@ func processAccounts(accounts []map[string]interface{}) ([]map[string]interface{
 			maxAccNum = num
 		}
 	}
+
+	logger.Printf("Found %d valid accounts, highest account number: %d", len(accountMap), maxAccNum)
 
 	// Find missing account numbers
 	var missingNums []int64
@@ -525,39 +530,68 @@ func processAccounts(accounts []map[string]interface{}) ([]map[string]interface{
 		}
 	}
 
+	// Try to fetch missing accounts in batches
 	if len(missingNums) > 0 {
 		logger.Printf("Found %d missing accounts, attempting to fetch them...", len(missingNums))
-		missingAccounts, err := fetchMissingAccounts(missingNums, 0) // height not needed for account lookup
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch missing accounts: %v", err)
-		}
 
-		// Add missing accounts to the map
-		for _, acc := range missingAccounts {
-			if numStr, ok := acc["account_number"].(string); ok {
-				if num, err := strconv.ParseInt(numStr, 10, 64); err == nil {
-					accountMap[num] = acc
+		// Split missing numbers into batches of 1000
+		batchSize := 1000
+		for i := 0; i < len(missingNums); i += batchSize {
+			end := i + batchSize
+			if end > len(missingNums) {
+				end = len(missingNums)
+			}
+
+			batch := missingNums[i:end]
+			logger.Printf("Fetching batch %d-%d of missing accounts...", i, end-1)
+
+			missingAccounts, err := fetchMissingAccounts(batch, 0)
+			if err != nil {
+				logger.Printf("Warning: failed to fetch batch of missing accounts: %v", err)
+				continue
+			}
+
+			// Add successfully fetched accounts to the map
+			for _, acc := range missingAccounts {
+				if numStr, ok := acc["account_number"].(string); ok {
+					if num, err := strconv.ParseInt(numStr, 10, 64); err == nil {
+						accountMap[num] = acc
+						logger.Printf("Retrieved missing account %d", num)
+					}
 				}
 			}
 		}
 	}
 
-	// Create sorted slice
-	sorted := make([]map[string]interface{}, maxAccNum+1)
+	// Create final sorted slice, skipping any still-missing accounts
+	var sorted []map[string]interface{}
 	var stillMissing []int64
 	for i := int64(0); i <= maxAccNum; i++ {
 		if acc, exists := accountMap[i]; exists {
-			sorted[i] = acc
+			sorted = append(sorted, acc)
 		} else {
 			stillMissing = append(stillMissing, i)
 		}
 	}
 
 	if len(stillMissing) > 0 {
-		return nil, fmt.Errorf("still missing %d accounts after fetching: %v", len(stillMissing), stillMissing)
+		logger.Printf("Warning: %d accounts still missing after fetching: %v",
+			len(stillMissing), stillMissing[:min(10, len(stillMissing))])
+		if len(stillMissing) > 10 {
+			logger.Printf("... and %d more", len(stillMissing)-10)
+		}
 	}
 
+	logger.Printf("Final account count: %d", len(sorted))
 	return sorted, nil
+}
+
+// Helper function
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // Add this function to handle balance updates

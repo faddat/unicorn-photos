@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/btcsuite/btcutil/bech32"
@@ -428,24 +429,87 @@ func writeJSONFile(filename string, data interface{}) error {
 	return nil
 }
 
-// Add this function to sort and validate accounts
+// Add this function to fetch specific account numbers
+func fetchMissingAccounts(missingNums []int64, height int64) ([]map[string]interface{}, error) {
+	logger.Printf("Fetching %d missing accounts...", len(missingNums))
+	var accounts []map[string]interface{}
+
+	// Create channels for parallel processing
+	workers := 50
+	jobs := make(chan int64, workers*2)
+	results := make(chan map[string]interface{}, workers*2)
+
+	// Start workers
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for num := range jobs {
+				url := fmt.Sprintf("https://rest.unicorn.meme/cosmos/auth/v1beta1/accounts/%d", num)
+				resp, err := httpClient.Get(url)
+				if err != nil {
+					logger.Printf("Failed to fetch account %d: %v", num, err)
+					continue
+				}
+
+				var result struct {
+					Account map[string]interface{} `json:"account"`
+				}
+				if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+					resp.Body.Close()
+					logger.Printf("Failed to decode account %d: %v", num, err)
+					continue
+				}
+				resp.Body.Close()
+
+				if result.Account != nil {
+					results <- result.Account
+				}
+			}
+		}()
+	}
+
+	// Send jobs
+	go func() {
+		for _, num := range missingNums {
+			jobs <- num
+		}
+		close(jobs)
+	}()
+
+	// Wait for all workers to complete
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect results
+	for account := range results {
+		accounts = append(accounts, account)
+	}
+
+	return accounts, nil
+}
+
+// Modify processAccounts to fetch missing accounts
 func processAccounts(accounts []map[string]interface{}) ([]map[string]interface{}, error) {
 	if len(accounts) == 0 {
 		return nil, fmt.Errorf("no accounts to process")
 	}
 
-	// Convert to a map keyed by account number for deduplication and sorting
+	// Convert to a map keyed by account number
 	accountMap := make(map[int64]map[string]interface{})
 	var maxAccNum int64 = -1
 
 	for _, acc := range accounts {
 		numStr, ok := acc["account_number"].(string)
 		if !ok {
-			continue // Skip accounts without account number
+			continue
 		}
 		num, err := strconv.ParseInt(numStr, 10, 64)
 		if err != nil {
-			continue // Skip invalid account numbers
+			continue
 		}
 		accountMap[num] = acc
 		if num > maxAccNum {
@@ -453,7 +517,7 @@ func processAccounts(accounts []map[string]interface{}) ([]map[string]interface{
 		}
 	}
 
-	// Check for gaps and log missing account numbers
+	// Find missing account numbers
 	var missingNums []int64
 	for i := int64(0); i <= maxAccNum; i++ {
 		if _, exists := accountMap[i]; !exists {
@@ -462,17 +526,35 @@ func processAccounts(accounts []map[string]interface{}) ([]map[string]interface{
 	}
 
 	if len(missingNums) > 0 {
-		return nil, fmt.Errorf("missing account numbers: %v", missingNums)
+		logger.Printf("Found %d missing accounts, attempting to fetch them...", len(missingNums))
+		missingAccounts, err := fetchMissingAccounts(missingNums, 0) // height not needed for account lookup
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch missing accounts: %v", err)
+		}
+
+		// Add missing accounts to the map
+		for _, acc := range missingAccounts {
+			if numStr, ok := acc["account_number"].(string); ok {
+				if num, err := strconv.ParseInt(numStr, 10, 64); err == nil {
+					accountMap[num] = acc
+				}
+			}
+		}
 	}
 
-	// Sort accounts by account number
+	// Create sorted slice
 	sorted := make([]map[string]interface{}, maxAccNum+1)
+	var stillMissing []int64
 	for i := int64(0); i <= maxAccNum; i++ {
-		acc, exists := accountMap[i]
-		if !exists {
-			return nil, fmt.Errorf("missing account number %d", i)
+		if acc, exists := accountMap[i]; exists {
+			sorted[i] = acc
+		} else {
+			stillMissing = append(stillMissing, i)
 		}
-		sorted[i] = acc
+	}
+
+	if len(stillMissing) > 0 {
+		return nil, fmt.Errorf("still missing %d accounts after fetching: %v", len(stillMissing), stillMissing)
 	}
 
 	return sorted, nil

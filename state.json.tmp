@@ -1,6 +1,3 @@
 {
-  "completed_endpoints": {
-    "/cosmos/auth/v1beta1/accounts": "c4fhvY4ke6YAPqZ0slzwjCbQQFk="
-  },
-  "block_height": 11775838
+  "block_height": 11776423
 }

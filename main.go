@@ -15,7 +15,7 @@ import (
 // REST_URL is the base URL for the blockchain's REST API.
 const REST_URL = "https://rest.unicorn.meme"
 
-// State represents the script’s progress for resuming.
+// State represents the script's progress for resuming.
 type State struct {
 	LastAccountPage    int      `json:"last_account_page"`
 	AccountNextKey     string   `json:"account_next_key"`
@@ -120,10 +120,10 @@ func fetchAll(endpoint, itemsKey string, state *State) ([]map[string]interface{}
 		// Save progress
 		pagination, ok := data["pagination"].(map[string]interface{})
 		if !ok || pagination["next_key"] == nil {
-		,state.CompletedAccounts = true
+			state.CompletedAccounts = true
 			break
 		}
-	[nextKey = pagination["next_key"].(string)
+		nextKey = pagination["next_key"].(string)
 		state.AccountNextKey = nextKey
 		state.LastAccountPage = page
 		if err := saveState(state); err != nil {
@@ -295,10 +295,10 @@ func main() {
 	if err != nil {
 		fmt.Printf("Warning: Using default auth params: %v\n", err)
 		authParams = map[string]interface{}{
-			"max_memo_characters":     "256",
-			"tx_sig_limit":            "7",
-			"tx_size_cost_per_byte":   "10",
-			"sig_verify_cost_ed25519": "590",
+			"max_memo_characters":       "256",
+			"tx_sig_limit":              "7",
+			"tx_size_cost_per_byte":     "10",
+			"sig_verify_cost_ed25519":   "590",
 			"sig_verify_cost_secp256k1": "1000",
 		}
 	}
@@ -307,7 +307,7 @@ func main() {
 	if err != nil {
 		fmt.Printf("Warning: Using default bank params: %v\n", err)
 		bankParams = map[string]interface{}{
-			"send_enabled":        []interface{}{},
+			"send_enabled":         []interface{}{},
 			"default_send_enabled": true,
 		}
 	}

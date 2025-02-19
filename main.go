@@ -255,13 +255,13 @@ func main() {
 	}
 
 	// Create channels for worker coordination
-	numWorkers := 800 // Increased from 10 to 50 workers
+	numWorkers := 1600 // Increased from 10 to 50 workers
 	jobs := make(chan int, len(accounts))
 	results := make(chan balanceResult, len(accounts))
 	var mu sync.Mutex
 
 	// Create rate limiter to prevent overwhelming the API
-	rateLimit := time.NewTicker(time.Millisecond * 01) // 20 requests per second
+	rateLimit := time.NewTicker(time.Microsecond * 2000) // 20 requests per second
 	defer rateLimit.Stop()
 
 	// Start worker goroutines

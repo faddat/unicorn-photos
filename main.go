@@ -33,6 +33,7 @@ type fetchResult struct {
 	Items   []map[string]interface{}
 	NextKey string
 	Err     error
+	Offset  int // For parallel offset fetching
 }
 
 // Logger with verbose output
@@ -129,15 +130,160 @@ func fetchWithRetry(url string, blockHeight int64, limiter *rate.Limiter) (*http
 	return nil, fmt.Errorf("exhausted retries for %s", url)
 }
 
-// fetchAll fetches paginated data with a worker pool.
+// fetchAccountsParallel fetches accounts using parallel offset pagination.
+func fetchAccountsParallel(endpoint, itemsKey string, state *State, workers int, limiter *rate.Limiter) ([]map[string]interface{}, error) {
+	const pageSize = 100
+	logger.Printf("Fetching %s (%s) in parallel with %d workers", endpoint, itemsKey, workers)
+
+	// Load cached data
+	cacheFile := fmt.Sprintf("%s.json.tmp", itemsKey)
+	var allItems []map[string]interface{}
+	if data, err := ioutil.ReadFile(cacheFile); err == nil {
+		if err := json.Unmarshal(data, &allItems); err == nil {
+			logger.Printf("Loaded %d cached %s from %s", len(allItems), itemsKey, cacheFile)
+			return allItems, nil
+		} else {
+			logger.Printf("Failed to unmarshal cached %s: %v", itemsKey, err)
+		}
+	}
+
+	// Fetch first page to get total
+	url := fmt.Sprintf("%s%s?pagination.limit=%d", REST_URL, endpoint, pageSize)
+	resp, err := fetchWithRetry(url, state.BlockHeight, limiter)
+	if err != nil {
+		logger.Printf("Failed to fetch first page: %v, falling back to next-key", err)
+		return fetchAll(endpoint, itemsKey, state, workers, limiter)
+	}
+	defer resp.Body.Close()
+
+	var firstPage map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&firstPage); err != nil {
+		logger.Printf("Failed to decode first page: %v, falling back to next-key", err)
+		return fetchAll(endpoint, itemsKey, state, workers, limiter)
+	}
+
+	pagination, ok := firstPage["pagination"].(map[string]interface{})
+	if !ok || pagination["total"] == nil {
+		logger.Println("No total in pagination, falling back to next-key")
+		return fetchAll(endpoint, itemsKey, state, workers, limiter)
+	}
+
+	var total int
+	switch t := pagination["total"].(type) {
+	case float64:
+		total = int(t)
+	case string:
+		totalInt, err := strconv.ParseInt(t, 10, 64)
+		if err != nil {
+			logger.Printf("Invalid total format: %v, falling back to next-key", err)
+			return fetchAll(endpoint, itemsKey, state, workers, limiter)
+		}
+		total = int(totalInt)
+	default:
+		logger.Printf("Unexpected total type: %T, falling back to next-key", t)
+		return fetchAll(endpoint, itemsKey, state, workers, limiter)
+	}
+
+	numPages := (total + pageSize - 1) / pageSize
+	logger.Printf("Total accounts: %d, pages: %d", total, numPages)
+
+	// Parallel fetch
+	jobs := make(chan int, numPages)
+	results := make(chan fetchResult, numPages)
+	var wg sync.WaitGroup
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for page := range jobs {
+				offset := page * pageSize
+				url := fmt.Sprintf("%s%s?pagination.limit=%d&pagination.offset=%d", REST_URL, endpoint, pageSize, offset)
+				logger.Printf("Worker %d: Fetching page %d (offset %d)", workerID, page, offset)
+
+				resp, err := fetchWithRetry(url, state.BlockHeight, limiter)
+				if err != nil {
+					results <- fetchResult{Offset: offset, Err: err}
+					continue
+				}
+				defer resp.Body.Close()
+
+				var data map[string]interface{}
+				if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+					logger.Printf("Worker %d: JSON decode error for page %d: %v", workerID, page, err)
+					results <- fetchResult{Offset: offset, Err: err}
+					continue
+				}
+
+				items, ok := data[itemsKey].([]interface{})
+				if !ok {
+					logger.Printf("Worker %d: Invalid %s format for page %d", workerID, itemsKey, page)
+					results <- fetchResult{Offset: offset, Err: fmt.Errorf("invalid %s format", itemsKey)}
+					continue
+				}
+
+				pageItems := make([]map[string]interface{}, 0, len(items))
+				for _, item := range items {
+					pageItems = append(pageItems, item.(map[string]interface{}))
+				}
+				logger.Printf("Worker %d: Fetched %d items for page %d", workerID, len(pageItems), page)
+				results <- fetchResult{Items: pageItems, Offset: offset}
+			}
+		}(i)
+	}
+
+	go func() {
+		for i := 0; i < numPages; i++ {
+			jobs <- i
+		}
+		close(jobs)
+	}()
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	seen := make(map[string]struct{})
+	for result := range results {
+		if result.Err != nil {
+			logger.Printf("Error fetching %s at offset %d: %v", itemsKey, result.Offset, result.Err)
+			continue
+		}
+		for _, item := range result.Items {
+			if addr, ok := item["address"].(string); ok {
+				if _, exists := seen[addr]; !exists {
+					seen[addr] = struct{}{}
+					allItems = append(allItems, item)
+				}
+			} else {
+				allItems = append(allItems, item)
+			}
+		}
+	}
+
+	dataBytes, _ := json.Marshal(allItems)
+	if err := ioutil.WriteFile(cacheFile, dataBytes, 0644); err != nil {
+		logger.Printf("Failed to cache %s: %v", itemsKey, err)
+	} else {
+		logger.Printf("Cached %d %s", len(allItems), itemsKey)
+	}
+	delete(state.CompletedEndpoints, endpoint)
+	if err := saveState(state, false); err != nil {
+		logger.Printf("Failed to save state: %v", err)
+	}
+	logger.Printf("Fetched %d %s", len(allItems), itemsKey)
+	return allItems, nil
+}
+
+// fetchAll fetches paginated data with next-key pagination (fallback).
 func fetchAll(endpoint, itemsKey string, state *State, workers int, limiter *rate.Limiter) ([]map[string]interface{}, error) {
 	const pageSize = 100
-	logger.Printf("Fetching %s (%s) with %d workers", endpoint, itemsKey, workers)
+	logger.Printf("Fetching %s (%s) with next-key and %d workers", endpoint, itemsKey, workers)
 	jobs := make(chan string, workers*2)
 	results := make(chan fetchResult, workers*2)
 	var wg sync.WaitGroup
 
-	// Load cached data
 	cacheFile := fmt.Sprintf("%s.json.tmp", itemsKey)
 	var allItems []map[string]interface{}
 	if data, err := ioutil.ReadFile(cacheFile); err == nil {
@@ -148,7 +294,6 @@ func fetchAll(endpoint, itemsKey string, state *State, workers int, limiter *rat
 		}
 	}
 
-	// Start workers
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func(workerID int) {
@@ -195,13 +340,11 @@ func fetchAll(endpoint, itemsKey string, state *State, workers int, limiter *rat
 		}(i)
 	}
 
-	// Start with initial key
 	nextKey := state.CompletedEndpoints[endpoint]
 	logger.Printf("Starting with next_key=%s", nextKey)
 	jobs <- nextKey
 	activeJobs := 1
 
-	// Collect results
 	go func() {
 		wg.Wait()
 		close(results)
@@ -334,39 +477,100 @@ func fetchBalances(accounts []map[string]interface{}, state *State, workers int,
 	return balances, nil
 }
 
-// fetchParams fetches module parameters.
+// fetchParams fetches module parameters with defaults for unimplemented endpoints.
 func fetchParams(endpoint string, state *State, limiter *rate.Limiter) (map[string]interface{}, error) {
-	cacheFile := fmt.Sprintf("%s_params.json.tmp", endpoint[1:])
+	cacheFile := fmt.Sprintf("%s_params.json.tmp", strings.ReplaceAll(endpoint, "/", "_"))
 	logger.Printf("Fetching params for %s", endpoint)
 	if data, err := ioutil.ReadFile(cacheFile); err == nil {
 		var params map[string]interface{}
-		if err := json.Unmarshal(data, &params); err == nil {
+		if json.Unmarshal(data, &params) == nil {
 			logger.Printf("Loaded cached params from %s", cacheFile)
 			return params, nil
 		}
-		logger.Printf("Failed to unmarshal cached params: %v", err)
 	}
 
 	url := fmt.Sprintf("%s%s", REST_URL, endpoint)
 	resp, err := fetchWithRetry(url, state.BlockHeight, limiter)
 	if err != nil {
-		logger.Printf("Failed to fetch params: %v", err)
-		return nil, err
+		logger.Printf("Failed to fetch params for %s: %v, using defaults", endpoint, err)
+		return getDefaultParams(endpoint), nil
 	}
 	defer resp.Body.Close()
 
 	var data map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		logger.Printf("JSON decode error: %v", err)
-		return nil, err
+		logger.Printf("JSON decode error for %s: %v, using defaults", endpoint, err)
+		return getDefaultParams(endpoint), nil
 	}
-	params, _ := data["params"].(map[string]interface{})
+	params, ok := data["params"].(map[string]interface{})
+	if !ok {
+		logger.Printf("Invalid params format for %s, using defaults", endpoint)
+		return getDefaultParams(endpoint), nil
+	}
 	dataBytes, _ := json.Marshal(params)
 	if err := ioutil.WriteFile(cacheFile, dataBytes, 0644); err != nil {
-		logger.Printf("Failed to cache params: %v", err)
+		logger.Printf("Failed to cache params to %s: %v", cacheFile, err)
+	} else {
+		logger.Printf("Cached params to %s", cacheFile)
 	}
 	logger.Printf("Fetched params for %s", endpoint)
 	return params, nil
+}
+
+// getDefaultParams provides fallback parameters for unimplemented endpoints.
+func getDefaultParams(endpoint string) map[string]interface{} {
+	switch endpoint {
+	case "/cosmos/auth/v1beta1/params":
+		return map[string]interface{}{
+			"max_memo_characters":       "256",
+			"tx_sig_limit":              "7",
+			"tx_size_cost_per_byte":     "10",
+			"sig_verify_cost_ed25519":   "590",
+			"sig_verify_cost_secp256k1": "1000",
+		}
+	case "/cosmos/bank/v1beta1/params":
+		return map[string]interface{}{
+			"send_enabled":         []interface{}{},
+			"default_send_enabled": true,
+		}
+	case "/cosmos/staking/v1beta1/params":
+		return map[string]interface{}{
+			"unbonding_time":     "1814400s",
+			"max_validators":     100,
+			"max_entries":        7,
+			"historical_entries": 10000,
+			"bond_denom":         "usei",
+		}
+	case "/cosmos/distribution/v1beta1/params":
+		return map[string]interface{}{
+			"community_tax":         "0.020000000000000000",
+			"base_proposer_reward":  "0.010000000000000000",
+			"bonus_proposer_reward": "0.040000000000000000",
+			"withdraw_addr_enabled": true,
+		}
+	case "/cosmos/gov/v1beta1/params":
+		return map[string]interface{}{
+			"deposit_params": map[string]interface{}{
+				"min_deposit": []interface{}{
+					map[string]interface{}{
+						"denom":  "usei",
+						"amount": "10000000",
+					},
+				},
+				"max_deposit_period": "172800s",
+			},
+			"voting_params": map[string]interface{}{
+				"voting_period": "172800s",
+			},
+			"tally_params": map[string]interface{}{
+				"quorum":         "0.334000000000000000",
+				"threshold":      "0.500000000000000000",
+				"veto_threshold": "0.334000000000000000",
+			},
+		}
+	default:
+		return map[string]interface{}{}
+	}
 }
 
 // convertAddress converts a Bech32 address.
@@ -470,7 +674,6 @@ func main() {
 	flag.Parse()
 	logger.Printf("Starting with prefix: %s", newPrefix)
 
-	// Rate limiter: 500 req/s with burst
 	limiter := rate.NewLimiter(500, 1000)
 	const workers = 50
 	logger.Printf("Using %d workers", workers)
@@ -509,7 +712,18 @@ func main() {
 		"/cosmos/gov/v1beta1/params",
 	}
 
-	for _, e := range fetchEndpoints {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		accounts, err := fetchAccountsParallel("/cosmos/auth/v1beta1/accounts", "accounts", state, workers, limiter)
+		if err != nil {
+			errChan <- fmt.Errorf("accounts: %v", err)
+			return
+		}
+		data["accounts"] = accounts
+	}()
+
+	for _, e := range fetchEndpoints[1:] {
 		wg.Add(1)
 		go func(e struct{ endpoint, key string }) {
 			defer wg.Done()
@@ -528,8 +742,7 @@ func main() {
 			defer wg.Done()
 			p, err := fetchParams(e, state, limiter)
 			if err != nil {
-				errChan <- fmt.Errorf("%s: %v", e, err)
-				return
+				logger.Printf("Warning: Failed to fetch %s params: %v, using defaults", e, err)
 			}
 			key := strings.Split(e, "/")[2]
 			params[key] = p
@@ -614,7 +827,7 @@ func main() {
 	logger.Println("Renaming temporary files...")
 	for _, key := range append([]string{"accounts", "balances", "validators", "delegation_responses", "metadatas"}, paramEndpoints...) {
 		tmp := fmt.Sprintf("%s.json.tmp", key)
-		final := fmt.Sprintf("%s.json", key)
+		final := fmt.Sprintf("%s.json", strings.ReplaceAll(key, "/", "_"))
 		if _, err := os.Stat(tmp); err == nil {
 			if err := os.Rename(tmp, final); err != nil {
 				logger.Printf("Failed to rename %s to %s: %v", tmp, final, err)

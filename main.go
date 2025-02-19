@@ -15,44 +15,100 @@ import (
 // REST_URL is the base URL for the blockchain's REST API.
 const REST_URL = "https://rest.unicorn.meme"
 
-// fetchAll retrieves paginated data from an endpoint with progress indicators.
-func fetchAll(endpoint, itemsKey string) ([]map[string]interface{}, error) {
+// State represents the script’s progress for resuming.
+type State struct {
+	LastAccountPage    int      `json:"last_account_page"`
+	AccountNextKey     string   `json:"account_next_key"`
+	CompletedAccounts  bool     `json:"completed_accounts"`
+	LastBalanceIndex   int      `json:"last_balance_index"`
+	CompletedBalances  bool     `json:"completed_balances"`
+	CompletedSnapshots []string `json:"completed_snapshots"`
+}
+
+// loadState loads the current state or initializes a new one.
+func loadState() (*State, error) {
+	if _, err := os.Stat("state.json"); os.IsNotExist(err) {
+		return &State{LastAccountPage: 0, LastBalanceIndex: -1}, nil
+	}
+	data, err := ioutil.ReadFile("state.json")
+	if err != nil {
+		return nil, fmt.Errorf("failed to read state: %v", err)
+	}
+	var state State
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil, fmt.Errorf("failed to parse state: %v", err)
+	}
+	return &state, nil
+}
+
+// saveState saves the current state to disk.
+func saveState(state *State) error {
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal state: %v", err)
+	}
+	return ioutil.WriteFile("state.json", data, 0644)
+}
+
+// fetchWithRetry performs an HTTP GET with retries on failure.
+func fetchWithRetry(url string, maxRetries int) (*http.Response, error) {
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		resp, err := http.Get(url)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			return resp, nil
+		}
+		if resp != nil {
+			resp.Body.Close()
+			fmt.Printf("Attempt %d failed: HTTP %d - %s\n", attempt+1, resp.StatusCode, url)
+		} else {
+			fmt.Printf("Attempt %d failed: %v - %s\n", attempt+1, err, url)
+		}
+		if attempt < maxRetries {
+			delay := time.Duration(1<<uint(attempt)) * time.Second
+			fmt.Printf("Retrying in %v...\n", delay)
+			time.Sleep(delay)
+		}
+	}
+	return nil, fmt.Errorf("exhausted retries for %s", url)
+}
+
+// fetchAll retrieves paginated data with resuming capability.
+func fetchAll(endpoint, itemsKey string, state *State) ([]map[string]interface{}, error) {
 	var allItems []map[string]interface{}
-	nextKey := ""
-	page := 1
+	if _, err := os.Stat(itemsKey + ".json"); err == nil && state.CompletedAccounts {
+		data, err := ioutil.ReadFile(itemsKey + ".json")
+		if err == nil {
+			if err := json.Unmarshal(data, &allItems); err == nil {
+				fmt.Printf("Loaded %d %s from cache.\n", len(allItems), itemsKey)
+				return allItems, nil
+			}
+		}
+	}
+
+	nextKey := state.AccountNextKey
+	page := state.LastAccountPage + 1
 
 	for {
-		// Construct URL with proper query parameter encoding
 		baseURL := fmt.Sprintf("%s%s", REST_URL, endpoint)
 		params := url.Values{}
-		params.Add("pagination.limit", "100") // Adjust limit as needed
+		params.Add("pagination.limit", "100")
 		if nextKey != "" {
 			params.Add("pagination.key", nextKey)
 		}
 		fullURL := fmt.Sprintf("%s?%s", baseURL, params.Encode())
 
 		fmt.Printf("Fetching %s page %d: %s\n", itemsKey, page, fullURL)
-
-		// Send HTTP request
-		resp, err := http.Get(fullURL)
+		resp, err := fetchWithRetry(fullURL, 3)
 		if err != nil {
-			return nil, fmt.Errorf("network error fetching %s: %v", itemsKey, err)
+			return nil, fmt.Errorf("failed to fetch %s after retries: %v", itemsKey, err)
 		}
 		defer resp.Body.Close()
 
-		// Check for HTTP errors and provide detailed feedback
-		if resp.StatusCode != http.StatusOK {
-			body, _ := ioutil.ReadAll(resp.Body)
-			return nil, fmt.Errorf("HTTP error %d fetching %s: %s", resp.StatusCode, itemsKey, string(body))
-		}
-
-		// Parse JSON response
 		var data map[string]interface{}
 		if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 			return nil, fmt.Errorf("JSON decode error for %s: %v", itemsKey, err)
 		}
 
-		// Extract items from response
 		items, ok := data[itemsKey].([]interface{})
 		if !ok {
 			return nil, fmt.Errorf("invalid response format for %s", itemsKey)
@@ -61,32 +117,50 @@ func fetchAll(endpoint, itemsKey string) ([]map[string]interface{}, error) {
 			allItems = append(allItems, item.(map[string]interface{}))
 		}
 
-		// Handle pagination
+		// Save progress
 		pagination, ok := data["pagination"].(map[string]interface{})
 		if !ok || pagination["next_key"] == nil {
+		,state.CompletedAccounts = true
 			break
 		}
-		nextKey = pagination["next_key"].(string)
+	[nextKey = pagination["next_key"].(string)
+		state.AccountNextKey = nextKey
+		state.LastAccountPage = page
+		if err := saveState(state); err != nil {
+			log.Printf("Warning: Failed to save state: %v", err)
+		}
+		// Cache items
+		dataBytes, _ := json.MarshalIndent(allItems, "", "  ")
+		ioutil.WriteFile(itemsKey+".json", dataBytes, 0644)
 		page++
 	}
 	fmt.Printf("Completed fetching %d %s.\n", len(allItems), itemsKey)
+	dataBytes, _ := json.MarshalIndent(allItems, "", "  ")
+	ioutil.WriteFile(itemsKey+".json", dataBytes, 0644)
 	return allItems, nil
 }
 
-// fetchParams fetches module parameters from an endpoint with progress feedback.
-func fetchParams(endpoint string) (map[string]interface{}, error) {
+// fetchParams fetches module parameters with retry logic.
+func fetchParams(endpoint string, state *State) (map[string]interface{}, error) {
+	if contains(state.CompletedSnapshots, endpoint) {
+		data, err := ioutil.ReadFile(endpoint[1:] + "_params.json")
+		if err == nil {
+			var params map[string]interface{}
+			if err := json.Unmarshal(data, &params); err == nil {
+				fmt.Printf("Loaded parameters from %s from cache.\n", endpoint)
+				return params, nil
+			}
+		}
+	}
+
 	fullURL := fmt.Sprintf("%s%s", REST_URL, endpoint)
 	fmt.Printf("Fetching parameters from %s\n", fullURL)
 
-	resp, err := http.Get(fullURL)
+	resp, err := fetchWithRetry(fullURL, 3)
 	if err != nil {
-		return nil, fmt.Errorf("network error: %v", err)
+		return nil, fmt.Errorf("failed to fetch params after retries: %v", err)
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP error: %d", resp.StatusCode)
-	}
 
 	var data map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
@@ -97,24 +171,30 @@ func fetchParams(endpoint string) (map[string]interface{}, error) {
 	if !ok {
 		return nil, fmt.Errorf("invalid params format")
 	}
+
+	// Cache and mark as completed
+	dataBytes, _ := json.MarshalIndent(params, "", "  ")
+	ioutil.WriteFile(endpoint[1:]+"_params.json", dataBytes, 0644)
+	state.CompletedSnapshots = append(state.CompletedSnapshots, endpoint)
+	saveState(state)
+
 	fmt.Printf("Successfully fetched parameters from %s\n", endpoint)
 	return params, nil
 }
 
-// fetchBalances retrieves balances for an account with progress indicators.
-func fetchBalances(address string, index, total int) ([]map[string]string, error) {
+// fetchBalances retrieves balances with resuming capability.
+func fetchBalances(address string, index, total int, state *State) ([]map[string]string, error) {
 	url := fmt.Sprintf("%s/cosmos/bank/v1beta1/balances/%s", REST_URL, address)
-	fmt.Printf("Fetching balances for account %d/%d: %s\n", index+1, total, address)
+	if index <= state.LastBalanceIndex {
+		return nil, nil // Skip already processed accounts
+	}
 
-	resp, err := http.Get(url)
+	fmt.Printf("Fetching balances for account %d/%d: %s\n", index+1, total, address)
+	resp, err := fetchWithRetry(url, 3)
 	if err != nil {
-		return nil, fmt.Errorf("network error: %v", err)
+		return nil, fmt.Errorf("failed to fetch balances after retries: %v", err)
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP error: %d", resp.StatusCode)
-	}
 
 	var data struct {
 		Balances []map[string]string `json:"balances"`
@@ -125,16 +205,31 @@ func fetchBalances(address string, index, total int) ([]map[string]string, error
 	return data.Balances, nil
 }
 
+// contains checks if a slice contains a string.
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}
+
 func main() {
-	// Step 1: Fetch all accounts
 	fmt.Println("Starting snapshot process...")
+
+	// Load or initialize state
+	state, err := loadState()
+	if err != nil {
+		log.Fatalf("Failed to load state: %v", err)
+	}
+
+	// Step 1: Fetch all accounts
 	fmt.Println("Step 1: Fetching all accounts...")
-	accounts, err := fetchAll("/cosmos/auth/v1beta1/accounts", "accounts")
+	accounts, err := fetchAll("/cosmos/auth/v1beta1/accounts", "accounts", state)
 	if err != nil {
 		log.Fatalf("Failed to fetch accounts: %v", err)
 	}
-
-	// Adjust BaseAccounts for genesis
 	for _, account := range accounts {
 		if account["@type"] == "/cosmos.auth.v1beta1.BaseAccount" {
 			account["account_number"] = "0"
@@ -145,17 +240,28 @@ func main() {
 	// Step 2: Fetch balances and calculate supply
 	fmt.Println("Step 2: Fetching account balances and calculating supply...")
 	balances := []map[string]interface{}{}
+	if _, err := os.Stat("balances.json"); err == nil && state.CompletedBalances {
+		data, _ := ioutil.ReadFile("balances.json")
+		json.Unmarshal(data, &balances)
+		fmt.Printf("Loaded %d balances from cache.\n", len(balances))
+	}
 	supply := make(map[string]*big.Int)
 	for i, account := range accounts {
+		if state.CompletedBalances {
+			break
+		}
 		address, ok := account["address"].(string)
 		if !ok {
-			fmt.Printf("Warning: Skipping account %d due to missing address\n", i+1)
+			fmt.Printf("Warning: Skipping account %d - no address\n", i+1)
 			continue
 		}
-		balResp, err := fetchBalances(address, i, len(accounts))
+		balResp, err := fetchBalances(address, i, len(accounts), state)
 		if err != nil {
 			fmt.Printf("Warning: Failed to fetch balances for %s: %v\n", address, err)
 			continue
+		}
+		if balResp == nil {
+			continue // Already processed
 		}
 		for _, coin := range balResp {
 			denom := coin["denom"]
@@ -174,14 +280,18 @@ func main() {
 			"address": address,
 			"coins":   balResp,
 		})
+		state.LastBalanceIndex = i
+		saveState(state)
+		dataBytes, _ := json.MarshalIndent(balances, "", "  ")
+		ioutil.WriteFile("balances.json", dataBytes, 0644)
 	}
+	state.CompletedBalances = true
+	saveState(state)
 	fmt.Printf("Collected balances for %d accounts.\n", len(balances))
 
 	// Step 3: Fetch additional module data
 	fmt.Println("Step 3: Fetching additional module data...")
-
-	// Auth parameters
-	authParams, err := fetchParams("/cosmos/auth/v1beta1/params")
+	authParams, err := fetchParams("/cosmos/auth/v1beta1/params", state)
 	if err != nil {
 		fmt.Printf("Warning: Using default auth params: %v\n", err)
 		authParams = map[string]interface{}{
@@ -193,8 +303,7 @@ func main() {
 		}
 	}
 
-	// Bank parameters
-	bankParams, err := fetchParams("/cosmos/bank/v1beta1/params")
+	bankParams, err := fetchParams("/cosmos/bank/v1beta1/params", state)
 	if err != nil {
 		fmt.Printf("Warning: Using default bank params: %v\n", err)
 		bankParams = map[string]interface{}{
@@ -203,15 +312,13 @@ func main() {
 		}
 	}
 
-	// Denomination metadata
-	denomMetadata, err := fetchAll("/cosmos/bank/v1beta1/denoms_metadata", "metadatas")
+	denomMetadata, err := fetchAll("/cosmos/bank/v1beta1/denoms_metadata", "metadatas", state)
 	if err != nil {
 		fmt.Printf("Warning: No denom metadata fetched: %v\n", err)
 		denomMetadata = []map[string]interface{}{}
 	}
 
-	// Staking parameters
-	stakingParams, err := fetchParams("/cosmos/staking/v1beta1/params")
+	stakingParams, err := fetchParams("/cosmos/staking/v1beta1/params", state)
 	if err != nil {
 		fmt.Printf("Warning: Using default staking params: %v\n", err)
 		stakingParams = map[string]interface{}{
@@ -223,22 +330,19 @@ func main() {
 		}
 	}
 
-	// Validators
-	validators, err := fetchAll("/cosmos/staking/v1beta1/validators", "validators")
+	validators, err := fetchAll("/cosmos/staking/v1beta1/validators", "validators", state)
 	if err != nil {
 		fmt.Printf("Warning: No validators fetched: %v\n", err)
 		validators = []map[string]interface{}{}
 	}
 
-	// Delegations
-	delegations, err := fetchAll("/cosmos/staking/v1beta1/delegations", "delegation_responses")
+	delegations, err := fetchAll("/cosmos/staking/v1beta1/delegations", "delegation_responses", state)
 	if err != nil {
 		fmt.Printf("Warning: No delegations fetched: %v\n", err)
 		delegations = []map[string]interface{}{}
 	}
 
-	// Distribution parameters
-	distParams, err := fetchParams("/cosmos/distribution/v1beta1/params")
+	distParams, err := fetchParams("/cosmos/distribution/v1beta1/params", state)
 	if err != nil {
 		fmt.Printf("Warning: Using default distribution params: %v\n", err)
 		distParams = map[string]interface{}{
@@ -249,8 +353,7 @@ func main() {
 		}
 	}
 
-	// Governance parameters
-	govParams, err := fetchParams("/cosmos/gov/v1beta1/params")
+	govParams, err := fetchParams("/cosmos/gov/v1beta1/params", state)
 	if err != nil {
 		fmt.Printf("Warning: Using default governance params: %v\n", err)
 		govParams = map[string]interface{}{
@@ -274,7 +377,7 @@ func main() {
 		}
 	}
 
-	// Step 4: Construct the genesis file
+	// Step 4: Construct genesis file
 	fmt.Println("Step 4: Constructing genesis.json...")
 	genesis := map[string]interface{}{
 		"genesis_time":   time.Now().UTC().Format(time.RFC3339),
@@ -343,7 +446,7 @@ func main() {
 		},
 	}
 
-	// Populate supply in genesis
+	// Populate supply
 	supplyList := []map[string]string{}
 	for denom, amount := range supply {
 		supplyList = append(supplyList, map[string]string{
@@ -353,15 +456,17 @@ func main() {
 	}
 	genesis["app_state"].(map[string]interface{})["bank"].(map[string]interface{})["supply"] = supplyList
 
-	// Step 5: Save to file
+	// Step 5: Save genesis file
 	fmt.Println("Step 5: Saving to genesis.json...")
 	genesisBytes, err := json.MarshalIndent(genesis, "", "  ")
 	if err != nil {
 		log.Fatalf("Failed to marshal genesis: %v", err)
 	}
-	if err := os.WriteFile("genesis.json", genesisBytes, 0644); err != nil {
+	if err := ioutil.WriteFile("genesis.json", genesisBytes, 0644); err != nil {
 		log.Fatalf("Failed to write genesis.json: %v", err)
 	}
 
+	// Clean up state file on success
+	os.Remove("state.json")
 	fmt.Println("Snapshot completed successfully! Check genesis.json.")
 }

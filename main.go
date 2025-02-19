@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -58,13 +59,14 @@ type TotalBalance struct {
 }
 
 // loadState loads or initializes state
-func loadState() (*State, error) {
+func loadState(snapshotDir string) (*State, error) {
 	logger.Println("Loading state from state.json.tmp...")
-	if _, err := os.Stat("state.json.tmp"); os.IsNotExist(err) {
+	stateFile := filepath.Join(snapshotDir, "state.json.tmp")
+	if _, err := os.Stat(stateFile); os.IsNotExist(err) {
 		logger.Println("Initializing new state.")
 		return &State{}, nil
 	}
-	data, err := os.ReadFile("state.json.tmp")
+	data, err := os.ReadFile(stateFile)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read state: %v", err)
 	}
@@ -77,14 +79,14 @@ func loadState() (*State, error) {
 }
 
 // saveState saves state to file
-func saveState(state *State, final bool) error {
+func saveState(state *State, final bool, snapshotDir string) error {
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal state: %v", err)
 	}
-	filename := "state.json.tmp"
+	filename := filepath.Join(snapshotDir, "state.json.tmp")
 	if final {
-		filename = "state.json"
+		filename = filepath.Join(snapshotDir, "state.json")
 	}
 	if err := os.WriteFile(filename, data, 0644); err != nil {
 		return err
@@ -138,11 +140,12 @@ func rpcQuery(method string, params map[string]interface{}) (map[string]interfac
 }
 
 // fetchRPC fetches data via RPC with pagination
-func fetchRPC(path, cacheFile string, height int64) ([]map[string]interface{}, error) {
-	if data, err := os.ReadFile(cacheFile); err == nil {
+func fetchRPC(path, cacheFile string, height int64, snapshotDir string) ([]map[string]interface{}, error) {
+	fullPath := filepath.Join(snapshotDir, cacheFile)
+	if data, err := os.ReadFile(fullPath); err == nil {
 		var items []map[string]interface{}
 		if err := json.Unmarshal(data, &items); err == nil {
-			logger.Printf("Loaded %d items from %s", len(items), cacheFile)
+			logger.Printf("Loaded %d items from %s", len(items), fullPath)
 			return items, nil
 		}
 	}
@@ -205,7 +208,7 @@ func fetchRPC(path, cacheFile string, height int64) ([]map[string]interface{}, e
 			// Save progress periodically
 			if len(allItems) > 0 && len(allItems)%1000 == 0 {
 				tempBytes, _ := json.Marshal(allItems)
-				if err := os.WriteFile("accounts.json.tmp", tempBytes, 0644); err != nil {
+				if err := os.WriteFile(filepath.Join(snapshotDir, "accounts.json.tmp"), tempBytes, 0644); err != nil {
 					logger.Printf("Failed to save progress: %v", err)
 				} else {
 					logger.Printf("Saved progress: %d accounts", len(allItems))
@@ -233,16 +236,16 @@ func fetchRPC(path, cacheFile string, height int64) ([]map[string]interface{}, e
 	}
 
 	dataBytes, _ := json.Marshal(allItems)
-	if err := os.WriteFile(cacheFile, dataBytes, 0644); err != nil {
-		logger.Printf("Failed to cache to %s: %v", cacheFile, err)
+	if err := os.WriteFile(fullPath, dataBytes, 0644); err != nil {
+		logger.Printf("Failed to cache to %s: %v", fullPath, err)
 	}
 	logger.Printf("Fetched total %d items via RPC for %s", len(allItems), path)
 	return allItems, nil
 }
 
 // fetchValidators fetches validators via RPC
-func fetchValidators(height int64) ([]map[string]interface{}, error) {
-	cacheFile := "validators.json.tmp"
+func fetchValidators(height int64, snapshotDir string) ([]map[string]interface{}, error) {
+	cacheFile := filepath.Join(snapshotDir, "validators.json.tmp")
 	if data, err := os.ReadFile(cacheFile); err == nil {
 		var validators []map[string]interface{}
 		if err := json.Unmarshal(data, &validators); err == nil {
@@ -281,8 +284,8 @@ func fetchValidators(height int64) ([]map[string]interface{}, error) {
 }
 
 // fetchParamsRPC fetches parameters via RPC
-func fetchParamsRPC(module string, height int64) (map[string]interface{}, error) {
-	cacheFile := fmt.Sprintf("%s_params.json.tmp", module)
+func fetchParamsRPC(module string, height int64, snapshotDir string) (map[string]interface{}, error) {
+	cacheFile := filepath.Join(snapshotDir, fmt.Sprintf("%s_params.json.tmp", module))
 	if data, err := os.ReadFile(cacheFile); err == nil {
 		var params map[string]interface{}
 		if err := json.Unmarshal(data, &params); err == nil {
@@ -430,23 +433,35 @@ func convertAddresses(appState map[string]interface{}, oldPrefix, newPrefix stri
 	}
 }
 
-// writeJSONFile writes JSON data with sorted keys and consistent formatting
-func writeJSONFile(filename string, data interface{}) error {
+// Add this function to manage snapshot directories
+func ensureSnapshotDir(height int64) (string, error) {
+	dirPath := fmt.Sprintf("snapshots/height_%d", height)
+	if err := os.MkdirAll(dirPath, 0755); err != nil {
+		return "", fmt.Errorf("failed to create snapshot directory: %v", err)
+	}
+	logger.Printf("Using snapshot directory: %s", dirPath)
+	return dirPath, nil
+}
+
+// Modify writeJSONFile to use snapshot directory
+func writeJSONFile(filename string, data interface{}, snapshotDir string) error {
+	fullPath := filepath.Join(snapshotDir, filename)
+
 	// For accounts, write directly
 	if filename == "accounts.json" {
 		sortedJSON, err := json.MarshalIndent(data, "", "  ")
 		if err != nil {
 			return fmt.Errorf("marshal failed: %v", err)
 		}
-		if err := os.WriteFile(filename, sortedJSON, 0644); err != nil {
+		if err := os.WriteFile(fullPath, sortedJSON, 0644); err != nil {
 			return fmt.Errorf("write failed: %v", err)
 		}
-		logger.Printf("Wrote %s", filename)
+		logger.Printf("Wrote %s", fullPath)
 		return nil
 	}
 
 	// For other files, use temp file
-	tempFile := filename + ".tmp"
+	tempFile := fullPath + ".tmp"
 	sortedJSON, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal failed: %v", err)
@@ -642,211 +657,163 @@ func shouldUpdateBalances(oldHeight, newHeight int64) bool {
 }
 
 // Modify updateBalances to track missing balances
-func updateBalances(accounts []map[string]interface{}, height int64) ([]map[string]interface{}, error) {
-	logger.Printf("Updating balances and delegations for %d accounts at height %d", len(accounts), height)
+func updateBalances(accounts []map[string]interface{}, height int64, snapshotDir string) ([]map[string]interface{}, error) {
+	logger.Printf("Starting balance update for %d accounts at height %d", len(accounts), height)
 
-	// Create a map to track which accounts we've processed
-	accountBalances := make(map[string]bool)
-	for _, acc := range accounts {
-		if addr, ok := acc["address"].(string); ok {
-			accountBalances[addr] = false // false means no balance fetched yet
-		}
-	}
-
-	// First fetch all delegations to build a map
+	// Fetch all delegations once at the start
 	logger.Println("Fetching all delegations...")
-	delegations, err := fetchRPC("/cosmos.staking.v1beta1/delegations", "delegations.json.tmp", height)
+	delegationMap := make(map[string]int64)
+	delegations, err := fetchRPC("/cosmos.staking.v1beta1/delegations", "delegations.json.tmp", height, snapshotDir)
 	if err != nil {
 		logger.Printf("Warning: failed to fetch delegations: %v", err)
+	} else {
+		// Build delegation map once
+		for _, del := range delegations {
+			if addr, ok := del["delegator_address"].(string); ok {
+				if shares, ok := del["shares"].(string); ok {
+					amount, err := strconv.ParseInt(shares, 10, 64)
+					if err != nil {
+						continue
+					}
+					delegationMap[addr] += amount
+				}
+			}
+		}
+		logger.Printf("Found delegations for %d addresses", len(delegationMap))
 	}
 
-	// Build delegation map
-	delegationMap := make(map[string]int64)
-	for _, del := range delegations {
-		if addr, ok := del["delegator_address"].(string); ok {
-			if shares, ok := del["shares"].(string); ok {
-				amount, err := strconv.ParseInt(shares, 10, 64)
+	// Create buffered channels
+	workers := 50
+	bufferSize := len(accounts)
+	jobs := make(chan string, bufferSize)
+	results := make(chan map[string]interface{}, bufferSize)
+
+	// Track progress
+	totalJobs := len(accounts)
+	jobsSent := 0
+	resultsReceived := 0
+	lastProgressLog := time.Now()
+
+	// Start workers with more logging
+	var wg sync.WaitGroup
+	logger.Printf("Starting %d balance fetch workers...", workers)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			logger.Printf("Worker %d started", workerID)
+			jobsProcessed := 0
+
+			for addr := range jobs {
+				jobsProcessed++
+				if jobsProcessed%100 == 0 {
+					logger.Printf("Worker %d has processed %d jobs", workerID, jobsProcessed)
+				}
+
+				url := fmt.Sprintf("https://rest.unicorn.meme/cosmos/bank/v1beta1/balances/%s", addr)
+				resp, err := httpClient.Get(url)
 				if err != nil {
+					logger.Printf("Worker %d: Failed to get balance for %s: %v", workerID, addr, err)
 					continue
 				}
-				delegationMap[addr] += amount
-			}
-		}
-	}
-	logger.Printf("Found delegations for %d addresses", len(delegationMap))
 
-	// Create channels for parallel processing
-	workers := 50
-	jobs := make(chan string, workers*2)
-	results := make(chan map[string]interface{}, workers*2)
-
-	// Track failed addresses for retry
-	var failedAddresses []string
-	maxRetries := 3
-
-	for retry := 0; retry < maxRetries; retry++ {
-		if retry > 0 {
-			if len(failedAddresses) == 0 {
-				break
-			}
-			logger.Printf("Retry %d: Attempting to fetch %d failed balances...",
-				retry, len(failedAddresses))
-			// Clear the slice for this retry
-			currentFailed := failedAddresses
-			failedAddresses = nil
-
-			// Send failed addresses back through for retry
-			for _, addr := range currentFailed {
-				jobs <- addr
-			}
-		} else {
-			// First pass - send all addresses
-			for _, acc := range accounts {
-				if addr, ok := acc["address"].(string); ok {
-					jobs <- addr
+				var balanceResp struct {
+					Balances []map[string]interface{} `json:"balances"`
 				}
-			}
-		}
-
-		// Start workers
-		var wg sync.WaitGroup
-		for w := 0; w < workers; w++ {
-			wg.Add(1)
-			go func(workerID int) {
-				defer wg.Done()
-				for addr := range jobs {
-					url := fmt.Sprintf("https://rest.unicorn.meme/cosmos/bank/v1beta1/balances/%s", addr)
-					resp, err := httpClient.Get(url)
-					if err != nil {
-						logger.Printf("Worker %d: Failed to get balance for %s: %v", workerID, addr, err)
-						failedAddresses = append(failedAddresses, addr)
-						continue
-					}
-
-					var balanceResp struct {
-						Balances []map[string]interface{} `json:"balances"`
-					}
-					if err := json.NewDecoder(resp.Body).Decode(&balanceResp); err != nil {
-						resp.Body.Close()
-						failedAddresses = append(failedAddresses, addr)
-						continue
-					}
+				if err := json.NewDecoder(resp.Body).Decode(&balanceResp); err != nil {
 					resp.Body.Close()
-
-					results <- map[string]interface{}{
-						"address": addr,
-						"coins":   balanceResp.Balances,
-					}
+					continue
 				}
-			}(w)
-		}
+				resp.Body.Close()
 
-		// Wait for all workers to complete
+				results <- map[string]interface{}{
+					"address": addr,
+					"coins":   balanceResp.Balances,
+				}
+			}
+			logger.Printf("Worker %d finished after processing %d jobs", workerID, jobsProcessed)
+		}(w)
+	}
+
+	// Send jobs with progress logging
+	go func() {
+		logger.Printf("Starting to send %d jobs to workers...", len(accounts))
+		for _, acc := range accounts {
+			if addr, ok := acc["address"].(string); ok {
+				jobs <- addr
+				jobsSent++
+				if jobsSent%1000 == 0 {
+					logger.Printf("Sent %d/%d jobs to workers (%.2f%%)",
+						jobsSent, totalJobs, float64(jobsSent)/float64(totalJobs)*100)
+				}
+			}
+		}
+		logger.Printf("All %d jobs sent to workers", jobsSent)
+		close(jobs)
+
+		// Wait for all workers in a separate goroutine
 		go func() {
 			wg.Wait()
+			logger.Println("All workers finished, closing results channel")
 			close(results)
 		}()
+	}()
 
-		// Collect results
-		var balances []map[string]interface{}
-		var totalBalances []TotalBalance
-		processed := 0
-		lastSave := time.Now()
+	// Collect results with more progress logging
+	var balances []map[string]interface{}
+	var totalBalances []TotalBalance
 
-		logger.Println("Starting to collect balance results...")
-		for balance := range results {
-			addr := balance["address"].(string)
-			var liquidAmount int64
-			var stakedAmount int64
+	logger.Println("Starting to collect balance results...")
+	for result := range results {
+		resultsReceived++
+		addr := result["address"].(string)
 
-			// Get liquid balance
-			coins := balance["coins"].([]interface{})
-			for _, coin := range coins {
-				coinMap := coin.(map[string]interface{})
-				if denom, ok := coinMap["denom"].(string); ok && denom == "uwunicorn" {
-					if amount, ok := coinMap["amount"].(string); ok {
+		var liquidAmount, stakedAmount int64
+
+		// Fix the type assertion for coins
+		if coinsRaw, ok := result["coins"].([]map[string]interface{}); ok {
+			for _, coin := range coinsRaw {
+				if denom, ok := coin["denom"].(string); ok && denom == "uwunicorn" {
+					if amount, ok := coin["amount"].(string); ok {
 						liquidAmount, _ = strconv.ParseInt(amount, 10, 64)
 					}
 				}
 			}
+		}
 
-			// Get staked balance
-			stakedAmount = delegationMap[addr]
+		// Get staked balance from pre-built map
+		stakedAmount = delegationMap[addr]
+
+		// Always include in balances, even if zero
+		balances = append(balances, result)
+
+		// Only include non-zero balances in totalBalances for richlist
+		if liquidAmount > 0 || stakedAmount > 0 {
 			totalAmount := liquidAmount + stakedAmount
-
-			if liquidAmount > 0 || stakedAmount > 0 {
-				totalBalances = append(totalBalances, TotalBalance{
-					Address:       addr,
-					Liquid:        strconv.FormatInt(liquidAmount, 10),
-					Staked:        strconv.FormatInt(stakedAmount, 10),
-					Total:         strconv.FormatInt(totalAmount, 10),
-					LiquidUnicorn: strconv.FormatFloat(float64(liquidAmount)/1000000, 'f', 6, 64),
-					StakedUnicorn: strconv.FormatFloat(float64(stakedAmount)/1000000, 'f', 6, 64),
-					TotalUnicorn:  strconv.FormatFloat(float64(totalAmount)/1000000, 'f', 6, 64),
-				})
-
-				// Keep original balance format for compatibility
-				balances = append(balances, balance)
-			}
-
-			processed++
-
-			// Save progress every minute
-			if time.Since(lastSave) > time.Minute {
-				logger.Printf("Saving intermediate balances (%d so far)...", len(balances))
-				if err := writeJSONFile("balances.json", balances); err != nil {
-					logger.Printf("Warning: Failed to save balance progress: %v", err)
-				}
-				if err := writeJSONFile("total_balances.json", totalBalances); err != nil {
-					logger.Printf("Warning: Failed to save total balances: %v", err)
-				}
-				lastSave = time.Now()
-			}
+			totalBalances = append(totalBalances, TotalBalance{
+				Address:       addr,
+				Liquid:        strconv.FormatInt(liquidAmount, 10),
+				Staked:        strconv.FormatInt(stakedAmount, 10),
+				Total:         strconv.FormatInt(totalAmount, 10),
+				LiquidUnicorn: strconv.FormatFloat(float64(liquidAmount)/1000000, 'f', 6, 64),
+				StakedUnicorn: strconv.FormatFloat(float64(stakedAmount)/1000000, 'f', 6, 64),
+				TotalUnicorn:  strconv.FormatFloat(float64(totalAmount)/1000000, 'f', 6, 64),
+			})
 		}
 
-		if len(failedAddresses) > 0 {
-			logger.Printf("Warning: Failed to fetch balances for %d addresses after all retries",
-				len(failedAddresses))
+		if time.Since(lastProgressLog) > 5*time.Second {
+			logger.Printf("Progress: %d/%d balances processed (%.2f%%)",
+				resultsReceived, totalJobs, float64(resultsReceived)/float64(totalJobs)*100)
+			lastProgressLog = time.Now()
 		}
-
-		// Final save
-		if err := writeJSONFile("balances.json", balances); err != nil {
-			return nil, fmt.Errorf("failed to write final balances: %v", err)
-		}
-		if err := writeJSONFile("total_balances.json", totalBalances); err != nil {
-			logger.Printf("Warning: Failed to write total balances: %v", err)
-		}
-
-		logger.Printf("Completed balance update: %d total balances (%d with non-zero balance)",
-			processed, len(totalBalances))
-
-		// Check for accounts missing balances
-		var missingBalances []string
-		for addr, processed := range accountBalances {
-			if !processed {
-				missingBalances = append(missingBalances, addr)
-			}
-		}
-
-		if len(missingBalances) > 0 {
-			logger.Printf("Warning: Missing balances for %d accounts", len(missingBalances))
-			if len(missingBalances) < 10 {
-				logger.Printf("Missing balances for: %v", missingBalances)
-			} else {
-				logger.Printf("First 10 missing balances: %v...", missingBalances[:10])
-			}
-			return nil, fmt.Errorf("failed to fetch balances for %d accounts", len(missingBalances))
-		}
-
-		return balances, nil
 	}
 
-	// If we get here, all retries failed
-	return nil, fmt.Errorf("failed to fetch balances after %d retries", maxRetries)
+	logger.Printf("Balance update complete: %d/%d accounts processed", resultsReceived, totalJobs)
+	return balances, nil
 }
 
 // Update generateRichlist to use total balances
-func generateRichlist(balances []TotalBalance) error {
+func generateRichlist(balances []TotalBalance, snapshotDir string) error {
 	logger.Println("Generating richlist...")
 
 	// Sort by total amount descending
@@ -883,7 +850,7 @@ func generateRichlist(balances []TotalBalance) error {
 	}
 
 	// Write richlist to file
-	if err := writeJSONFile("richlist.json", richlist); err != nil {
+	if err := writeJSONFile("richlist.json", richlist, snapshotDir); err != nil {
 		return fmt.Errorf("failed to write richlist: %v", err)
 	}
 
@@ -907,17 +874,84 @@ func generateRichlist(balances []TotalBalance) error {
 	return nil
 }
 
+// Add this function to calculate total supply
+func calculateSupply(balances []map[string]interface{}) (int64, float64) {
+	var totalUwunicorn int64
+	for _, bal := range balances {
+		if coins, ok := bal["coins"].([]map[string]interface{}); ok {
+			for _, coin := range coins {
+				if denom, ok := coin["denom"].(string); ok && denom == "uwunicorn" {
+					if amount, ok := coin["amount"].(string); ok {
+						if amt, err := strconv.ParseInt(amount, 10, 64); err == nil {
+							totalUwunicorn += amt
+						}
+					}
+				}
+			}
+		}
+	}
+	totalUnicorn := float64(totalUwunicorn) / 1000000.0
+	return totalUwunicorn, totalUnicorn
+}
+
+// Update the updateReadme function
+func updateReadme(height int64, snapshotDir string, balances []map[string]interface{}) error {
+	const readmeFile = "README.md"
+	var content string
+
+	// Read existing README if it exists
+	if data, err := os.ReadFile(readmeFile); err == nil {
+		content = string(data)
+	}
+
+	// Calculate supply
+	totalUwunicorn, totalUnicorn := calculateSupply(balances)
+
+	// Add new snapshot entry with supply information
+	timestamp := time.Now().UTC().Format(time.RFC3339)
+	newEntry := fmt.Sprintf(`
+## Snapshot %d
+
+- Height: %d
+- Time: %s
+- Path: %s
+- Total Supply: %d uwunicorn (%.6f UNICORN)
+`,
+		height, height, timestamp, snapshotDir, totalUwunicorn, totalUnicorn)
+
+	if !strings.Contains(content, fmt.Sprintf("## Snapshot %d", height)) {
+		content = content + newEntry
+		if err := os.WriteFile(readmeFile, []byte(content), 0644); err != nil {
+			return fmt.Errorf("failed to update README: %v", err)
+		}
+		logger.Printf("Updated README.md with snapshot %d (Total Supply: %.6f UNICORN)", height, totalUnicorn)
+	}
+
+	return nil
+}
+
 func main() {
 	logger.Println("=== Starting Unicorn Snapshot ===")
 	logger.Printf("Block height check...")
 
+	// Initialize data map and accounts slice
+	data := make(map[string][]map[string]interface{})
+	var accounts []map[string]interface{}
+
 	var newPrefix string
 	flag.StringVar(&newPrefix, "prefix", "unicorn", "New Bech32 prefix (default: unicorn)")
+	var force bool
+	flag.BoolVar(&force, "force", false, "Force re-collection of data even if height is complete")
 	flag.Parse()
 	logger.Printf("Using Bech32 prefix: %s", newPrefix)
 
-	// Load state
-	state, err := loadState()
+	// Load state from snapshot directory
+	snapshotDir, err := ensureSnapshotDir(0)
+	if err != nil {
+		logger.Fatalf("Failed to create snapshot directory: %v", err)
+	}
+
+	state, err := loadState(snapshotDir)
 	if err != nil {
 		logger.Fatalf("Load state failed: %v", err)
 	}
@@ -928,106 +962,44 @@ func main() {
 		logger.Fatalf("Get block height failed: %v", err)
 	}
 
-	// Check if we need to start fresh at new height
-	if state.BlockHeight != latestHeight {
-		logger.Printf("Block height changed from %d to %d", state.BlockHeight, latestHeight)
-		state.startNewHeight(latestHeight)
-	} else if state.isHeightComplete() {
-		logger.Printf("All data already collected for height %d", latestHeight)
-		if !flag.Lookup("force").Value.(flag.Getter).Get().(bool) {
-			logger.Println("Use --force to re-collect data")
-			return
-		}
-		logger.Println("Force flag set, re-collecting data")
-		state.startNewHeight(latestHeight)
-	} else {
-		logger.Printf("Resuming data collection for height %d", latestHeight)
+	// Load root accounts first
+	rootAccounts, err := loadRootAccounts()
+	if err != nil {
+		logger.Printf("Warning: Failed to load root accounts: %v", err)
 	}
 
-	// Add force flag
-	var force bool
-	flag.BoolVar(&force, "force", false, "Force re-collection of data even if height is complete")
-
-	// Update completion flags as we go
-	if !state.AccountsComplete {
-		// Fetch accounts code...
-		state.AccountsComplete = true
-		saveState(state, false)
-	} else {
-		logger.Println("Using existing accounts data")
+	// Create snapshot directory
+	snapshotDir, err = ensureSnapshotDir(latestHeight)
+	if err != nil {
+		logger.Fatalf("Failed to create snapshot directory: %v", err)
 	}
 
-	if !state.BalancesComplete {
-		// Update balances code...
-		state.BalancesComplete = true
-		saveState(state, false)
-	} else {
-		logger.Println("Using existing balances data")
-	}
-
-	if !state.ValidatorsComplete {
-		// Fetch validators code...
-		state.ValidatorsComplete = true
-		saveState(state, false)
-	} else {
-		logger.Println("Using existing validators data")
-	}
-
-	// Final state save
-	if state.isHeightComplete() {
-		logger.Printf("All data collection complete for height %d", state.BlockHeight)
-		if err := state.commitFiles(); err != nil {
-			logger.Printf("Warning: Failed to commit files: %v", err)
-		}
-		cleanupTempFiles()
-		saveState(state, true)
-	} else {
-		logger.Printf("Snapshot incomplete at height %d", state.BlockHeight)
-		if state.LastIncompleteHeight > 0 {
-			logger.Printf("Previous incomplete snapshot at height %d", state.LastIncompleteHeight)
-		}
-		saveState(state, false)
-	}
-
-	// Fetch data
-	data := make(map[string][]map[string]interface{})
-	var accounts []map[string]interface{}
-
-	// Fetch accounts via REST
-	if fileData, err := os.ReadFile("accounts.json"); err == nil {
-		// Load existing accounts
-		if err := json.Unmarshal(fileData, &accounts); err != nil {
-			logger.Fatalf("Failed to parse accounts.json: %v", err)
-		}
-		logger.Printf("Loaded %d existing accounts", len(accounts))
-
-		// Find missing and new accounts
+	// Use root accounts and fetch only new ones
+	if rootAccounts != nil {
+		accounts = rootAccounts
 		missingNums, err := findMissingAndNewAccounts(accounts)
 		if err != nil {
 			logger.Printf("Warning: Error checking for missing accounts: %v", err)
 		} else if len(missingNums) > 0 {
-			logger.Printf("Fetching %d missing accounts...", len(missingNums))
+			logger.Printf("Fetching %d new accounts...", len(missingNums))
 			newAccounts, err := fetchMissingAccounts(missingNums, latestHeight)
 			if err != nil {
-				logger.Printf("Warning: Failed to fetch missing accounts: %v", err)
+				logger.Printf("Warning: Failed to fetch new accounts: %v", err)
 			} else {
 				accounts = append(accounts, newAccounts...)
-				logger.Printf("Added %d new/missing accounts", len(newAccounts))
-
-				// Save updated accounts
-				if err := writeJSONFile("accounts.json", accounts); err != nil {
-					logger.Printf("Warning: Failed to save updated accounts: %v", err)
+				if err := updateRootAccounts(accounts); err != nil {
+					logger.Printf("Warning: %v", err)
 				}
 			}
-		} else {
-			logger.Println("No missing or new accounts found")
 		}
 	} else {
-		// No existing accounts.json, fetch everything
-		logger.Println("No existing accounts.json, fetching all accounts...")
+		// No root accounts.json, fetch everything
 		accounts, err = fetchAccountsParallel()
 		if err != nil {
 			logger.Fatalf("Failed to fetch accounts: %v", err)
+		}
+		if err := updateRootAccounts(accounts); err != nil {
+			logger.Printf("Warning: %v", err)
 		}
 	}
 
@@ -1039,14 +1011,15 @@ func main() {
 
 	// Update balances if needed
 	if shouldUpdateBalances(state.BlockHeight, latestHeight) {
-		data["balances"], err = updateBalances(accounts, latestHeight)
+		data["balances"], err = updateBalances(accounts, latestHeight, snapshotDir)
 		if err != nil {
 			logger.Fatalf("Failed to update balances: %v", err)
 		}
 	} else {
 		// Load existing balances
 		var balances []map[string]interface{}
-		if balanceData, err := os.ReadFile("balances.json"); err == nil {
+		balancesFile := filepath.Join(snapshotDir, "balances.json")
+		if balanceData, err := os.ReadFile(balancesFile); err == nil {
 			if err := json.Unmarshal(balanceData, &balances); err != nil {
 				logger.Fatalf("Failed to parse balances.json: %v", err)
 			}
@@ -1097,27 +1070,27 @@ func main() {
 			}
 		}
 
-		if err := generateRichlist(totalBalances); err != nil {
+		if err := generateRichlist(totalBalances, snapshotDir); err != nil {
 			logger.Printf("Warning: Failed to generate richlist: %v", err)
 		}
 	}
 
 	logger.Println("=== Fetching Validators ===")
-	data["validators"], err = fetchValidators(latestHeight)
+	data["validators"], err = fetchValidators(latestHeight, snapshotDir)
 	if err != nil {
 		logger.Printf("Warning: validator fetch failed: %v", err)
 	}
 	logger.Printf("Found %d validators", len(data["validators"]))
 
 	logger.Println("=== Fetching Delegations ===")
-	data["delegations"], err = fetchRPC("/cosmos.staking.v1beta1/delegations", "delegations.json.tmp", latestHeight)
+	data["delegations"], err = fetchRPC("/cosmos.staking.v1beta1/delegations", "delegations.json.tmp", latestHeight, snapshotDir)
 	if err != nil {
 		logger.Printf("Warning: delegations fetch failed: %v", err)
 	}
 	logger.Printf("Found %d delegations", len(data["delegations"]))
 
 	logger.Println("=== Fetching Denom Metadata ===")
-	data["denom_metadata"], err = fetchRPC("/cosmos.bank.v1beta1/denoms_metadata", "metadatas.json.tmp", latestHeight)
+	data["denom_metadata"], err = fetchRPC("/cosmos.bank.v1beta1/denoms_metadata", "metadatas.json.tmp", latestHeight, snapshotDir)
 	if err != nil {
 		logger.Printf("Warning: metadata fetch failed: %v", err)
 	}
@@ -1128,7 +1101,7 @@ func main() {
 	params := make(map[string]map[string]interface{})
 	for _, module := range []string{"auth", "bank", "staking", "distribution", "gov"} {
 		logger.Printf("Fetching %s parameters...", module)
-		params[module], err = fetchParamsRPC(module, latestHeight)
+		params[module], err = fetchParamsRPC(module, latestHeight, snapshotDir)
 		if err != nil {
 			logger.Printf("Warning: %s params fetch failed: %v", module, err)
 		}
@@ -1179,7 +1152,7 @@ func main() {
 	for _, key := range []string{"accounts", "balances", "validators", "delegations", "metadatas"} {
 		if data[key] != nil {
 			logger.Printf("Writing %s.json (%d entries)...", key, len(data[key]))
-			if err := writeJSONFile(key+".json", data[key]); err != nil {
+			if err := writeJSONFile(key+".json", data[key], snapshotDir); err != nil {
 				logger.Printf("Warning: write %s failed: %v", key, err)
 			}
 		}
@@ -1188,18 +1161,18 @@ func main() {
 	logger.Println("Writing parameter files...")
 	for module, moduleParams := range params {
 		logger.Printf("Writing %s_params.json...", module)
-		if err := writeJSONFile(module+"_params.json", moduleParams); err != nil {
+		if err := writeJSONFile(module+"_params.json", moduleParams, snapshotDir); err != nil {
 			logger.Printf("Warning: write %s params failed: %v", module, err)
 		}
 	}
 
 	// After fetching balances, save state again
-	if err := saveState(state, true); err != nil {
+	if err := saveState(state, true, snapshotDir); err != nil {
 		logger.Printf("Failed to save final state: %v", err)
 	}
 
 	// Clean up at the end
-	defer cleanupAllTempFiles()
+	defer cleanupAllTempFiles(snapshotDir)
 
 	logger.Println("=== Snapshot Complete ===")
 	logger.Printf("Final block height: %d", latestHeight)
@@ -1210,6 +1183,11 @@ func main() {
 	logger.Printf("Total metadata entries: %d", len(data["denom_metadata"]))
 	logger.Println("Snapshot completed!")
 	fmt.Println("Snapshot completed!")
+
+	// Update README after successful snapshot
+	if err := updateReadme(latestHeight, snapshotDir, data["balances"]); err != nil {
+		logger.Printf("Warning: %v", err)
+	}
 }
 
 // Add this function to check completion
@@ -1400,24 +1378,45 @@ func cleanupTempFiles() {
 	}
 }
 
-// Add this function to clean up all temp files
-func cleanupAllTempFiles() {
-	logger.Println("Cleaning up all temporary files...")
-	// Get all files in current directory
-	files, err := os.ReadDir(".")
+// Update cleanupAllTempFiles to work in snapshot directory
+func cleanupAllTempFiles(snapshotDir string) {
+	logger.Printf("Cleaning up temporary files in %s", snapshotDir)
+	files, err := os.ReadDir(snapshotDir)
 	if err != nil {
 		logger.Printf("Warning: Failed to read directory for cleanup: %v", err)
 		return
 	}
 
-	// Remove any .tmp files
 	for _, file := range files {
 		if strings.HasSuffix(file.Name(), ".tmp") {
-			if err := os.Remove(file.Name()); err != nil {
-				logger.Printf("Warning: Failed to remove %s: %v", file.Name(), err)
+			fullPath := filepath.Join(snapshotDir, file.Name())
+			if err := os.Remove(fullPath); err != nil {
+				logger.Printf("Warning: Failed to remove %s: %v", fullPath, err)
 			} else {
-				logger.Printf("Removed temporary file: %s", file.Name())
+				logger.Printf("Removed temporary file: %s", fullPath)
 			}
 		}
 	}
+}
+
+// Add this function to manage root accounts file
+func loadRootAccounts() ([]map[string]interface{}, error) {
+	if data, err := os.ReadFile("accounts.json"); err == nil {
+		var accounts []map[string]interface{}
+		if err := json.Unmarshal(data, &accounts); err != nil {
+			return nil, fmt.Errorf("failed to parse root accounts.json: %v", err)
+		}
+		logger.Printf("Loaded %d accounts from root accounts.json", len(accounts))
+		return accounts, nil
+	}
+	return nil, nil
+}
+
+// Add this function to update root accounts
+func updateRootAccounts(accounts []map[string]interface{}) error {
+	if err := writeJSONFile("accounts.json", accounts, "."); err != nil {
+		return fmt.Errorf("failed to update root accounts.json: %v", err)
+	}
+	logger.Printf("Updated root accounts.json with %d accounts", len(accounts))
+	return nil
 }

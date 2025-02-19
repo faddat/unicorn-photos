@@ -754,7 +754,7 @@ func updateBalances(accounts []map[string]interface{}, height int64, snapshotDir
 	logger.Printf("Found %d addresses remaining to process", remainingAddrsCount)
 
 	// Create buffered channels
-	workers := 400
+	workers := 800
 	bufferSize := len(accounts)
 	jobs := make(chan string, bufferSize)
 	results := make(chan map[string]interface{}, bufferSize)

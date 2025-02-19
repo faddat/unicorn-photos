@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -30,7 +32,7 @@ var logger = log.New(os.Stdout, "[SNAPSHOT] ", log.Ldate|log.Ltime|log.Lmicrosec
 
 // HTTP client
 var httpClient = &http.Client{
-	Timeout: 10 * time.Second,
+	Timeout: 30 * time.Second,
 	Transport: &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 50,
@@ -736,7 +738,273 @@ func shouldUpdateBalances(oldHeight, newHeight int64) bool {
 	return oldHeight != newHeight
 }
 
+// Add this function for exponential backoff
+func fetchWithBackoff(url string, maxAttempts int) (*http.Response, error) {
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(math.Pow(2, float64(attempt))) * time.Second
+			logger.Printf("Backing off for %v before retry %d", backoff, attempt+1)
+			time.Sleep(backoff)
+		}
+
+		resp, err := httpClient.Get(url)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		logger.Printf("Request failed (attempt %d/%d): %v", attempt+1, maxAttempts, err)
+	}
+	return nil, fmt.Errorf("all attempts failed: %v", lastErr)
+}
+
+// Add this function to safely append accounts
+func appendToAccountsFile(accounts []map[string]interface{}) error {
+	// First read existing accounts
+	var existingAccounts []map[string]interface{}
+	if data, err := os.ReadFile("accounts.json"); err == nil {
+		if err := json.Unmarshal(data, &existingAccounts); err == nil {
+			logger.Printf("Read %d existing accounts", len(existingAccounts))
+		}
+	}
+
+	// Create map of existing accounts by account number
+	accountMap := make(map[string]bool)
+	for _, acc := range existingAccounts {
+		if numStr, ok := acc["account_number"].(string); ok {
+			accountMap[numStr] = true
+		}
+	}
+
+	// Add new accounts that don't exist yet
+	added := 0
+	for _, acc := range accounts {
+		if numStr, ok := acc["account_number"].(string); ok {
+			if !accountMap[numStr] {
+				existingAccounts = append(existingAccounts, acc)
+				accountMap[numStr] = true
+				added++
+			}
+		}
+	}
+
+	if added > 0 {
+		logger.Printf("Adding %d new accounts", added)
+		// Write all accounts back to file
+		if err := writeJSONFile("accounts.json", existingAccounts); err != nil {
+			return fmt.Errorf("failed to write accounts: %v", err)
+		}
+		logger.Printf("Successfully wrote %d total accounts", len(existingAccounts))
+	}
+
+	return nil
+}
+
+// Add this function to handle parallel account fetching
+func fetchAccountsParallel() ([]map[string]interface{}, error) {
+	logger.Println("Starting parallel account fetch...")
+
+	// Try to get first page to determine total
+	logger.Println("Getting initial page to determine total...")
+	url := "https://rest.unicorn.meme/cosmos/auth/v1beta1/accounts?pagination.limit=1&pagination.count_total=true"
+	resp, err := httpClient.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get initial page: %v", err)
+	}
+
+	var initialResp struct {
+		Accounts   []map[string]interface{} `json:"accounts"`
+		Pagination struct {
+			Total string `json:"total"`
+		} `json:"pagination"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&initialResp); err != nil {
+		resp.Body.Close()
+		return nil, fmt.Errorf("failed to decode initial response: %v", err)
+	}
+	resp.Body.Close()
+
+	// If no total provided, try to estimate from highest account number
+	var total int64
+	if initialResp.Pagination.Total == "" {
+		logger.Println("No total provided, fetching last account to estimate...")
+		// Try a large offset to find the last account
+		testURL := "https://rest.unicorn.meme/cosmos/auth/v1beta1/accounts?pagination.limit=1&pagination.offset=999999"
+		resp, err := httpClient.Get(testURL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to estimate total: %v", err)
+		}
+		var testResp struct {
+			Accounts []map[string]interface{} `json:"accounts"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&testResp); err != nil {
+			resp.Body.Close()
+			return nil, fmt.Errorf("failed to decode test response: %v", err)
+		}
+		resp.Body.Close()
+
+		if len(testResp.Accounts) > 0 {
+			if numStr, ok := testResp.Accounts[0]["account_number"].(string); ok {
+				if num, err := strconv.ParseInt(numStr, 10, 64); err == nil {
+					total = num + 1
+					logger.Printf("Estimated total accounts: %d", total)
+				}
+			}
+		}
+	} else {
+		total, err = strconv.ParseInt(initialResp.Pagination.Total, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid total: %v", err)
+		}
+		logger.Printf("Got total accounts from API: %d", total)
+	}
+
+	if total == 0 {
+		return nil, fmt.Errorf("could not determine total number of accounts")
+	}
+
+	// Create worker pool
+	workers := 100
+	pageSize := 1000
+	pages := (total + int64(pageSize) - 1) / int64(pageSize)
+	logger.Printf("Using %d workers to fetch %d pages with %d accounts per page", workers, pages, pageSize)
+
+	type pageResult struct {
+		accounts []map[string]interface{}
+		page     int64
+		err      error
+	}
+
+	jobs := make(chan int64, workers*2)
+	results := make(chan pageResult, workers*2)
+
+	// Start workers
+	var wg sync.WaitGroup
+	logger.Printf("Starting %d worker goroutines...", workers)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for page := range jobs {
+				offset := page * int64(pageSize)
+				url := fmt.Sprintf("https://rest.unicorn.meme/cosmos/auth/v1beta1/accounts?pagination.limit=%d&pagination.offset=%d",
+					pageSize, offset)
+
+				var result pageResult
+				resp, err := fetchWithBackoff(url, 5)
+				if err != nil {
+					result.err = err
+					result.page = page
+					results <- result
+					continue
+				}
+
+				var pageData struct {
+					Accounts []map[string]interface{} `json:"accounts"`
+				}
+
+				body, err := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if err != nil {
+					result.err = fmt.Errorf("failed to read response: %v", err)
+					result.page = page
+					results <- result
+					continue
+				}
+
+				if err := json.Unmarshal(body, &pageData); err != nil {
+					result.err = fmt.Errorf("failed to decode response: %v", err)
+					result.page = page
+					results <- result
+					continue
+				}
+
+				result.accounts = pageData.Accounts
+				result.page = page
+				result.err = nil
+				results <- result
+
+				// Save progress every 10 pages per worker
+				if page%10 == 0 {
+					logger.Printf("Worker %d completed page %d", workerID, page)
+				}
+			}
+		}(w)
+	}
+
+	// Send jobs and wait for completion
+	go func() {
+		// Send all jobs
+		for p := int64(0); p < pages; p++ {
+			jobs <- p
+		}
+		close(jobs)
+
+		// Wait for all workers to finish
+		wg.Wait()
+
+		// Close results channel
+		close(results)
+		logger.Println("All workers completed, results channel closed")
+	}()
+
+	// Collect results
+	processed := int64(0)
+	lastLog := time.Now()
+	successCount := int64(0)
+	errorCount := int64(0)
+
+	logger.Println("Starting to collect results...")
+	for result := range results {
+		processed++
+		if result.err != nil {
+			errorCount++
+			logger.Printf("Error fetching page %d: %v (errors: %d/%d)",
+				result.page, result.err, errorCount, processed)
+		} else {
+			successCount++
+			// Write accounts immediately
+			if err := appendToAccountsFile(result.accounts); err != nil {
+				logger.Printf("Warning: Failed to append accounts from page %d: %v",
+					result.page, err)
+			}
+			logger.Printf("Processed page %d with %d accounts (success: %d/%d)",
+				result.page, len(result.accounts), successCount, processed)
+		}
+
+		// Log progress every 5 seconds
+		if time.Since(lastLog) > 5*time.Second {
+			logger.Printf("Progress: %d/%d pages (%.2f%%), Success: %d, Errors: %d",
+				processed, pages, float64(processed)/float64(pages)*100,
+				successCount, errorCount)
+			lastLog = time.Now()
+		}
+
+		if processed >= pages {
+			break
+		}
+	}
+
+	logger.Printf("Account fetch complete: %d/%d pages successful (%.2f%% success rate)",
+		successCount, pages, float64(successCount)/float64(pages)*100)
+
+	// Read the final accounts file to return
+	var finalAccounts []map[string]interface{}
+	if data, err := os.ReadFile("accounts.json"); err == nil {
+		if err := json.Unmarshal(data, &finalAccounts); err != nil {
+			return nil, fmt.Errorf("failed to read final accounts: %v", err)
+		}
+		logger.Printf("Returning %d total accounts", len(finalAccounts))
+		return finalAccounts, nil
+	}
+
+	return nil, fmt.Errorf("failed to read final accounts file")
+}
+
 func main() {
+	logger.Println("=== Starting Unicorn Snapshot ===")
+	logger.Printf("Block height check...")
+
 	var newPrefix string
 	flag.StringVar(&newPrefix, "prefix", "unicorn", "New Bech32 prefix (default: unicorn)")
 	flag.Parse()
@@ -756,11 +1024,14 @@ func main() {
 
 	// Check if block height has changed
 	if shouldUpdateBalances(state.BlockHeight, latestHeight) {
-		logger.Printf("Block height changed from %d to %d, will update balances",
-			state.BlockHeight, latestHeight)
-		// Remove existing balance files to force refresh
-		os.Remove("balances.json")
-		os.Remove("balances.json.tmp")
+		logger.Println("=== Starting Balance Update ===")
+		logger.Printf("Removing old balance files...")
+		if err := os.Remove("balances.json"); err != nil && !os.IsNotExist(err) {
+			logger.Printf("Warning: failed to remove balances.json: %v", err)
+		}
+		if err := os.Remove("balances.json.tmp"); err != nil && !os.IsNotExist(err) {
+			logger.Printf("Warning: failed to remove balances.json.tmp: %v", err)
+		}
 	}
 
 	state.BlockHeight = latestHeight
@@ -770,79 +1041,36 @@ func main() {
 
 	// Fetch data
 	data := make(map[string][]map[string]interface{})
+	var accounts []map[string]interface{}
 
 	// Fetch accounts via REST
-	accountsURL := "https://rest.unicorn.meme/cosmos/auth/v1beta1/accounts"
-	var allAccounts []map[string]interface{}
-	nextKey := ""
-	pageSize := 500
-
 	if valid, lastNum := validateAccounts("accounts.json"); valid {
 		logger.Printf("Using existing accounts.json with %d accounts", lastNum+1)
-		data, err := os.ReadFile("accounts.json")
+		fileData, err := os.ReadFile("accounts.json")
 		if err != nil {
 			logger.Fatalf("Failed to read accounts.json: %v", err)
 		}
-		if err := json.Unmarshal(data, &allAccounts); err != nil {
+		if err := json.Unmarshal(fileData, &accounts); err != nil {
 			logger.Fatalf("Failed to parse accounts.json: %v", err)
 		}
+		data["accounts"] = accounts
 	} else {
-		// Proceed with fetching accounts...
-		for {
-			url := accountsURL
-			if nextKey != "" {
-				url = fmt.Sprintf("%s?pagination.key=%s&pagination.limit=%d", accountsURL, nextKey, pageSize)
-			} else {
-				url = fmt.Sprintf("%s?pagination.limit=%d", accountsURL, pageSize)
-			}
-
-			resp, err := httpClient.Get(url)
-			if err != nil {
-				logger.Printf("Failed to fetch accounts: %v", err)
-				break
-			}
-
-			var result struct {
-				Accounts   []map[string]interface{} `json:"accounts"`
-				Pagination struct {
-					NextKey string `json:"next_key"`
-					Total   string `json:"total"`
-				} `json:"pagination"`
-			}
-
-			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-				resp.Body.Close()
-				logger.Printf("Failed to decode accounts: %v", err)
-				break
-			}
-			resp.Body.Close()
-
-			allAccounts = append(allAccounts, result.Accounts...)
-			logger.Printf("Fetched %d accounts (total: %d, expected: %s)",
-				len(result.Accounts), len(allAccounts), result.Pagination.Total)
-
-			// Save progress periodically
-			if len(allAccounts)%1000 == 0 {
-				if err := writeJSONFile("accounts.json", allAccounts); err != nil {
-					logger.Printf("Failed to save progress: %v", err)
-				}
-			}
-
-			if result.Pagination.NextKey == "" {
-				break
-			}
-			nextKey = result.Pagination.NextKey
+		accounts, err = fetchAccountsParallel()
+		if err != nil {
+			logger.Fatalf("Failed to fetch accounts: %v", err)
 		}
+		data["accounts"] = accounts
 	}
 
 	// Process accounts
-	if allAccounts, err = processAccounts(allAccounts); err != nil {
+	if accounts, err = processAccounts(accounts); err != nil {
 		logger.Fatalf("Failed to process accounts: %v", err)
 	}
+	data["accounts"] = accounts
 
 	// Update balances if needed
 	if shouldUpdateBalances(state.BlockHeight, latestHeight) {
-		data["balances"], err = updateBalances(allAccounts, latestHeight)
+		data["balances"], err = updateBalances(accounts, latestHeight)
 		if err != nil {
 			logger.Fatalf("Failed to update balances: %v", err)
 		}
@@ -858,17 +1086,41 @@ func main() {
 		}
 	}
 
-	data["validators"], _ = fetchValidators(latestHeight)
-	data["delegations"], _ = fetchRPC("/cosmos.staking.v1beta1/delegations", "delegations.json.tmp", latestHeight)
-	data["denom_metadata"], _ = fetchRPC("/cosmos.bank.v1beta1/denoms_metadata", "metadatas.json.tmp", latestHeight)
+	logger.Println("=== Fetching Validators ===")
+	data["validators"], err = fetchValidators(latestHeight)
+	if err != nil {
+		logger.Printf("Warning: validator fetch failed: %v", err)
+	}
+	logger.Printf("Found %d validators", len(data["validators"]))
+
+	logger.Println("=== Fetching Delegations ===")
+	data["delegations"], err = fetchRPC("/cosmos.staking.v1beta1/delegations", "delegations.json.tmp", latestHeight)
+	if err != nil {
+		logger.Printf("Warning: delegations fetch failed: %v", err)
+	}
+	logger.Printf("Found %d delegations", len(data["delegations"]))
+
+	logger.Println("=== Fetching Denom Metadata ===")
+	data["denom_metadata"], err = fetchRPC("/cosmos.bank.v1beta1/denoms_metadata", "metadatas.json.tmp", latestHeight)
+	if err != nil {
+		logger.Printf("Warning: metadata fetch failed: %v", err)
+	}
+	logger.Printf("Found %d denom metadata entries", len(data["denom_metadata"]))
 
 	// Fetch parameters
+	logger.Println("=== Fetching Module Parameters ===")
 	params := make(map[string]map[string]interface{})
 	for _, module := range []string{"auth", "bank", "staking", "distribution", "gov"} {
-		params[module], _ = fetchParamsRPC(module, latestHeight)
+		logger.Printf("Fetching %s parameters...", module)
+		params[module], err = fetchParamsRPC(module, latestHeight)
+		if err != nil {
+			logger.Printf("Warning: %s params fetch failed: %v", module, err)
+		}
 	}
 
 	// Construct genesis
+	logger.Println("=== Constructing Genesis File ===")
+	logger.Printf("Creating genesis state at height %d", latestHeight)
 	genesis := map[string]interface{}{
 		"genesis_time":   time.Now().UTC().Format(time.RFC3339),
 		"chain_id":       "unicorn-snapshot",
@@ -902,26 +1154,26 @@ func main() {
 			}
 		}
 	}
+	logger.Println("=== Converting Addresses ===")
+	logger.Printf("Converting from prefix '%s' to '%s'", oldPrefix, newPrefix)
 	convertAddresses(genesis["app_state"].(map[string]interface{}), oldPrefix, newPrefix)
 
 	// Write genesis
-	if err := writeJSONFile("genesis.json", genesis); err != nil {
-		logger.Fatalf("Write genesis failed: %v", err)
-	}
-
-	// Finalize files
+	logger.Println("=== Writing Output Files ===")
 	for _, key := range []string{"accounts", "balances", "validators", "delegations", "metadatas"} {
 		if data[key] != nil {
+			logger.Printf("Writing %s.json (%d entries)...", key, len(data[key]))
 			if err := writeJSONFile(key+".json", data[key]); err != nil {
-				logger.Printf("Write %s failed: %v", key, err)
+				logger.Printf("Warning: write %s failed: %v", key, err)
 			}
 		}
 	}
 
-	// Write params files
+	logger.Println("Writing parameter files...")
 	for module, moduleParams := range params {
+		logger.Printf("Writing %s_params.json...", module)
 		if err := writeJSONFile(module+"_params.json", moduleParams); err != nil {
-			logger.Printf("Write %s params failed: %v", module, err)
+			logger.Printf("Warning: write %s params failed: %v", module, err)
 		}
 	}
 
@@ -930,6 +1182,13 @@ func main() {
 		logger.Printf("Failed to save final state: %v", err)
 	}
 
+	logger.Println("=== Snapshot Complete ===")
+	logger.Printf("Final block height: %d", latestHeight)
+	logger.Printf("Total accounts: %d", len(data["accounts"]))
+	logger.Printf("Total balances: %d", len(data["balances"]))
+	logger.Printf("Total validators: %d", len(data["validators"]))
+	logger.Printf("Total delegations: %d", len(data["delegations"]))
+	logger.Printf("Total metadata entries: %d", len(data["denom_metadata"]))
 	logger.Println("Snapshot completed!")
 	fmt.Println("Snapshot completed!")
 }

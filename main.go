@@ -136,8 +136,25 @@ func fetchAll(endpoint, itemsKey string, state *State) ([]map[string]interface{}
 		return nil, fmt.Errorf("JSON decode error: %v", err)
 	}
 
-	pagination := firstPage["pagination"].(map[string]interface{})
-	total := int(pagination["total"].(float64))
+	pagination, ok := firstPage["pagination"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid pagination format")
+	}
+
+	var total int
+	switch t := pagination["total"].(type) {
+	case float64:
+		total = int(t)
+	case string:
+		totalInt, err := strconv.ParseInt(t, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid total format: %v", err)
+		}
+		total = int(totalInt)
+	default:
+		return nil, fmt.Errorf("unexpected total type: %T", pagination["total"])
+	}
+
 	pageSize := 100
 	numPages := (total + pageSize - 1) / pageSize
 

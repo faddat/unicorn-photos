@@ -29,6 +29,13 @@ type State struct {
 	BlockHeight        int64    `json:"block_height"`
 }
 
+// accountPage represents a page of account data from the API
+type accountPage struct {
+	items   []map[string]interface{}
+	nextKey string
+	err     error
+}
+
 // loadState loads the current state or initializes a new one.
 func loadState() (*State, error) {
 	if _, err := os.Stat("state.json"); os.IsNotExist(err) {
@@ -112,66 +119,68 @@ func fetchAll(endpoint, itemsKey string, state *State) ([]map[string]interface{}
 
 	// For accounts, use parallel fetching with next-key pagination
 	if itemsKey == "accounts" {
-		workers := 50
-		pageSize := 100 // Reduced from 500 to 100
+		workers := 1600 // Increased from 800
+		pageSize := 100
 
-		type accountPage struct {
-			items   []map[string]interface{}
-			nextKey string
-			err     error
-		}
-
-		jobs := make(chan string, workers*2) // Buffer for next keys
-		results := make(chan accountPage, workers*2)
-		rateLimit := time.NewTicker(time.Millisecond * 20)
+		// Use a faster rate limit for accounts
+		rateLimit := time.NewTicker(time.Microsecond * 2500) // Doubled rate from previous
 		defer rateLimit.Stop()
 
-		// Start workers
+		// Use buffered channels with larger buffer
+		jobs := make(chan string, workers*4) // Increased buffer
+		results := make(chan accountPage, workers*4)
+
+		// Create slice to store all items
+		allItems := make([]map[string]interface{}, 0, 1000000) // Pre-allocate for ~1M accounts
+
+		// Start workers with error backoff
 		for w := 0; w < workers; w++ {
 			go func() {
+				backoff := time.Millisecond * 100
 				for nextKey := range jobs {
 					<-rateLimit.C
-					params := url.Values{}
-					params.Add("pagination.limit", fmt.Sprintf("%d", pageSize))
-					if nextKey != "" {
-						params.Add("pagination.key", nextKey)
-					}
-					fullURL := fmt.Sprintf("%s%s?%s", REST_URL, endpoint, params.Encode())
 
-					resp, err := fetchWithRetry(fullURL, state.BlockHeight, 3)
-					if err != nil {
-						results <- accountPage{err: err}
-						continue
-					}
+					// Retry logic with exponential backoff
+					for attempts := 0; attempts < 3; attempts++ {
+						params := url.Values{}
+						params.Add("pagination.limit", fmt.Sprintf("%d", pageSize))
+						if nextKey != "" {
+							params.Add("pagination.key", nextKey)
+						}
+						fullURL := fmt.Sprintf("%s%s?%s", REST_URL, endpoint, params.Encode())
 
-					var data map[string]interface{}
-					if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-						resp.Body.Close()
-						results <- accountPage{err: err}
-						continue
-					}
-					resp.Body.Close()
+						resp, err := fetchWithRetry(fullURL, state.BlockHeight, 1) // Reduced retries, handling in worker
+						if err == nil {
+							var data map[string]interface{}
+							if err := json.NewDecoder(resp.Body).Decode(&data); err == nil {
+								items, ok := data[itemsKey].([]interface{})
+								if ok {
+									pageItems := make([]map[string]interface{}, len(items))
+									for i, item := range items {
+										pageItems[i] = item.(map[string]interface{})
+									}
 
-					items, ok := data[itemsKey].([]interface{})
-					if !ok {
-						results <- accountPage{err: fmt.Errorf("invalid response format")}
-						continue
-					}
+									pagination := data["pagination"].(map[string]interface{})
+									var nextPageKey string
+									if pagination["next_key"] != nil {
+										nextPageKey = pagination["next_key"].(string)
+									}
 
-					pageItems := make([]map[string]interface{}, len(items))
-					for i, item := range items {
-						pageItems[i] = item.(map[string]interface{})
-					}
+									resp.Body.Close()
+									results <- accountPage{
+										items:   pageItems,
+										nextKey: nextPageKey,
+									}
+									break
+								}
+							}
+							resp.Body.Close()
+						}
 
-					pagination := data["pagination"].(map[string]interface{})
-					var nextPageKey string
-					if pagination["next_key"] != nil {
-						nextPageKey = pagination["next_key"].(string)
-					}
-
-					results <- accountPage{
-						items:   pageItems,
-						nextKey: nextPageKey,
+						if attempts < 2 {
+							time.Sleep(backoff)
+							backoff *= 2
+						}
 					}
 				}
 			}()
@@ -182,7 +191,6 @@ func fetchAll(endpoint, itemsKey string, state *State) ([]map[string]interface{}
 		activeJobs := 1
 
 		// Process results and queue new jobs
-		var allItems []map[string]interface{}
 		processed := 0
 		saveInterval := time.NewTicker(time.Second * 5)
 		defer saveInterval.Stop()

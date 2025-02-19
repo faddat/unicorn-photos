@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -245,46 +246,102 @@ func main() {
 		json.Unmarshal(data, &balances)
 		fmt.Printf("Loaded %d balances from cache.\n", len(balances))
 	}
-	supply := make(map[string]*big.Int)
-	for i, account := range accounts {
-		if state.CompletedBalances {
-			break
-		}
-		address, ok := account["address"].(string)
-		if !ok {
-			fmt.Printf("Warning: Skipping account %d - no address\n", i+1)
-			continue
-		}
-		balResp, err := fetchBalances(address, i, len(accounts), state)
-		if err != nil {
-			fmt.Printf("Warning: Failed to fetch balances for %s: %v\n", address, err)
-			continue
-		}
-		if balResp == nil {
-			continue // Already processed
-		}
-		for _, coin := range balResp {
-			denom := coin["denom"]
-			amountStr := coin["amount"]
-			amount, ok := new(big.Int).SetString(amountStr, 10)
-			if !ok {
-				fmt.Printf("Warning: Invalid amount for %s: %s\n", denom, amountStr)
+
+	type balanceResult struct {
+		index   int
+		address string
+		coins   []map[string]string
+		err     error
+	}
+
+	// Create channels for worker coordination
+	numWorkers := 10
+	jobs := make(chan int, len(accounts))
+	results := make(chan balanceResult, len(accounts))
+	var mu sync.Mutex
+
+	// Start worker goroutines
+	for w := 0; w < numWorkers; w++ {
+		go func() {
+			for i := range jobs {
+				if state.CompletedBalances {
+					continue
+				}
+				account := accounts[i]
+				address, ok := account["address"].(string)
+				if !ok {
+					results <- balanceResult{index: i, err: fmt.Errorf("no address")}
+					continue
+				}
+				balResp, err := fetchBalances(address, i, len(accounts), state)
+				results <- balanceResult{
+					index:   i,
+					address: address,
+					coins:   balResp,
+					err:     err,
+				}
+			}
+		}()
+	}
+
+	// Send jobs to workers
+	go func() {
+		for i := range accounts {
+			if i <= state.LastBalanceIndex {
 				continue
 			}
-			if _, exists := supply[denom]; !exists {
-				supply[denom] = new(big.Int)
-			}
-			supply[denom].Add(supply[denom], amount)
+			jobs <- i
 		}
-		balances = append(balances, map[string]interface{}{
-			"address": address,
-			"coins":   balResp,
-		})
-		state.LastBalanceIndex = i
-		saveState(state)
-		dataBytes, _ := json.MarshalIndent(balances, "", "  ")
-		ioutil.WriteFile("balances.json", dataBytes, 0644)
+		close(jobs)
+	}()
+
+	// Process results
+	supply := make(map[string]*big.Int)
+	processed := 0
+	expected := len(accounts) - state.LastBalanceIndex - 1
+	if expected > 0 {
+		for result := range results {
+			processed++
+			if result.err != nil {
+				fmt.Printf("Warning: Failed to fetch balances for account %d: %v\n", result.index+1, result.err)
+				continue
+			}
+			if result.coins == nil {
+				continue // Already processed
+			}
+
+			mu.Lock()
+			for _, coin := range result.coins {
+				denom := coin["denom"]
+				amountStr := coin["amount"]
+				amount, ok := new(big.Int).SetString(amountStr, 10)
+				if !ok {
+					fmt.Printf("Warning: Invalid amount for %s: %s\n", denom, amountStr)
+					continue
+				}
+				if _, exists := supply[denom]; !exists {
+					supply[denom] = new(big.Int)
+				}
+				supply[denom].Add(supply[denom], amount)
+			}
+
+			balances = append(balances, map[string]interface{}{
+				"address": result.address,
+				"coins":   result.coins,
+			})
+
+			state.LastBalanceIndex = result.index
+			saveState(state)
+			dataBytes, _ := json.MarshalIndent(balances, "", "  ")
+			ioutil.WriteFile("balances.json", dataBytes, 0644)
+			mu.Unlock()
+
+			if processed >= expected {
+				break
+			}
+		}
 	}
+
 	state.CompletedBalances = true
 	saveState(state)
 	fmt.Printf("Collected balances for %d accounts.\n", len(balances))

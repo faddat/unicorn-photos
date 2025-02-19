@@ -472,6 +472,11 @@ func validateAccounts(filename string) (bool, int64) {
 	return true, lastNum
 }
 
+// Add this function to check if we need to update balances
+func shouldUpdateBalances(oldHeight, newHeight int64) bool {
+	return oldHeight != newHeight
+}
+
 func main() {
 	var newPrefix string
 	flag.StringVar(&newPrefix, "prefix", "unicorn", "New Bech32 prefix (default: unicorn)")
@@ -484,12 +489,25 @@ func main() {
 		logger.Fatalf("Load state failed: %v", err)
 	}
 
-	// Get block height
-	blockHeight, err := getLatestBlockHeight()
+	// Get latest block height
+	latestHeight, err := getLatestBlockHeight()
 	if err != nil {
 		logger.Fatalf("Get block height failed: %v", err)
 	}
-	state.BlockHeight = blockHeight
+
+	// Check if block height has changed
+	if shouldUpdateBalances(state.BlockHeight, latestHeight) {
+		logger.Printf("Block height changed from %d to %d, will update balances",
+			state.BlockHeight, latestHeight)
+		// Remove existing balance files to force refresh
+		os.Remove("balances.json")
+		os.Remove("balances.json.tmp")
+	}
+
+	state.BlockHeight = latestHeight
+	if err := saveState(state, false); err != nil { // Save to state.json immediately
+		logger.Printf("Failed to save state: %v", err)
+	}
 
 	// Fetch data
 	data := make(map[string][]map[string]interface{})
@@ -559,15 +577,15 @@ func main() {
 	}
 
 	data["accounts"] = allAccounts
-	data["balances"], _ = fetchRPC("/cosmos.bank.v1beta1/balances", "balances.json.tmp", blockHeight)
-	data["validators"], _ = fetchValidators(blockHeight)
-	data["delegations"], _ = fetchRPC("/cosmos.staking.v1beta1/delegations", "delegations.json.tmp", blockHeight)
-	data["denom_metadata"], _ = fetchRPC("/cosmos.bank.v1beta1/denoms_metadata", "metadatas.json.tmp", blockHeight)
+	data["balances"], _ = fetchRPC("/cosmos.bank.v1beta1/balances", "balances.json.tmp", latestHeight)
+	data["validators"], _ = fetchValidators(latestHeight)
+	data["delegations"], _ = fetchRPC("/cosmos.staking.v1beta1/delegations", "delegations.json.tmp", latestHeight)
+	data["denom_metadata"], _ = fetchRPC("/cosmos.bank.v1beta1/denoms_metadata", "metadatas.json.tmp", latestHeight)
 
 	// Fetch parameters
 	params := make(map[string]map[string]interface{})
 	for _, module := range []string{"auth", "bank", "staking", "distribution", "gov"} {
-		params[module], _ = fetchParamsRPC(module, blockHeight)
+		params[module], _ = fetchParamsRPC(module, latestHeight)
 	}
 
 	// Construct genesis
@@ -627,8 +645,9 @@ func main() {
 		}
 	}
 
+	// After fetching balances, save state again
 	if err := saveState(state, true); err != nil {
-		logger.Printf("Save state failed: %v", err)
+		logger.Printf("Failed to save final state: %v", err)
 	}
 
 	logger.Println("Snapshot completed!")

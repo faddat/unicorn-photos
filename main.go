@@ -132,12 +132,12 @@ func fetchAll(endpoint, itemsKey string, state *State) ([]map[string]interface{}
 		}
 		// Cache items
 		dataBytes, _ := json.MarshalIndent(allItems, "", "  ")
-		ioutil.WriteFile(itemsKey+".json", dataBytes, 0644)
+		os.WriteFile(itemsKey+".json", dataBytes, 0644)
 		page++
 	}
 	fmt.Printf("Completed fetching %d %s.\n", len(allItems), itemsKey)
 	dataBytes, _ := json.MarshalIndent(allItems, "", "  ")
-	ioutil.WriteFile(itemsKey+".json", dataBytes, 0644)
+	os.WriteFile(itemsKey+".json", dataBytes, 0644)
 	return allItems, nil
 }
 
@@ -175,7 +175,7 @@ func fetchParams(endpoint string, state *State) (map[string]interface{}, error) 
 
 	// Cache and mark as completed
 	dataBytes, _ := json.MarshalIndent(params, "", "  ")
-	ioutil.WriteFile(endpoint[1:]+"_params.json", dataBytes, 0644)
+	os.WriteFile(endpoint[1:]+"_params.json", dataBytes, 0644)
 	state.CompletedSnapshots = append(state.CompletedSnapshots, endpoint)
 	saveState(state)
 
@@ -255,10 +255,14 @@ func main() {
 	}
 
 	// Create channels for worker coordination
-	numWorkers := 10
+	numWorkers := 800 // Increased from 10 to 50 workers
 	jobs := make(chan int, len(accounts))
 	results := make(chan balanceResult, len(accounts))
 	var mu sync.Mutex
+
+	// Create rate limiter to prevent overwhelming the API
+	rateLimit := time.NewTicker(time.Millisecond * 01) // 20 requests per second
+	defer rateLimit.Stop()
 
 	// Start worker goroutines
 	for w := 0; w < numWorkers; w++ {
@@ -267,12 +271,16 @@ func main() {
 				if state.CompletedBalances {
 					continue
 				}
+				<-rateLimit.C // Rate limit our requests
+
 				account := accounts[i]
 				address, ok := account["address"].(string)
 				if !ok {
 					results <- balanceResult{index: i, err: fmt.Errorf("no address")}
 					continue
 				}
+
+				// Batch save every 100 records instead of every single one
 				balResp, err := fetchBalances(address, i, len(accounts), state)
 				results <- balanceResult{
 					index:   i,
@@ -295,6 +303,11 @@ func main() {
 		close(jobs)
 	}()
 
+	// Process results with batched writes
+	const batchSize = 100
+	batchedBalances := make([]map[string]interface{}, 0, batchSize)
+	lastSave := time.Now()
+
 	// Process results
 	supply := make(map[string]*big.Int)
 	processed := 0
@@ -307,7 +320,7 @@ func main() {
 				continue
 			}
 			if result.coins == nil {
-				continue // Already processed
+				continue
 			}
 
 			mu.Lock()
@@ -325,20 +338,35 @@ func main() {
 				supply[denom].Add(supply[denom], amount)
 			}
 
-			balances = append(balances, map[string]interface{}{
+			batchedBalances = append(batchedBalances, map[string]interface{}{
 				"address": result.address,
 				"coins":   result.coins,
 			})
 
-			state.LastBalanceIndex = result.index
-			saveState(state)
-			dataBytes, _ := json.MarshalIndent(balances, "", "  ")
-			ioutil.WriteFile("balances.json", dataBytes, 0644)
+			// Save state and balances every 100 records or after 5 seconds
+			if len(batchedBalances) >= batchSize || time.Since(lastSave) > 5*time.Second {
+				balances = append(balances, batchedBalances...)
+				state.LastBalanceIndex = result.index
+				saveState(state)
+				dataBytes, _ := json.MarshalIndent(balances, "", "  ")
+				os.WriteFile("balances.json", dataBytes, 0644)
+				batchedBalances = batchedBalances[:0]
+				lastSave = time.Now()
+			}
 			mu.Unlock()
 
 			if processed >= expected {
 				break
 			}
+		}
+
+		// Save any remaining balances
+		if len(batchedBalances) > 0 {
+			mu.Lock()
+			balances = append(balances, batchedBalances...)
+			dataBytes, _ := json.MarshalIndent(balances, "", "  ")
+			os.WriteFile("balances.json", dataBytes, 0644)
+			mu.Unlock()
 		}
 	}
 
@@ -519,7 +547,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to marshal genesis: %v", err)
 	}
-	if err := ioutil.WriteFile("genesis.json", genesisBytes, 0644); err != nil {
+	if err := os.WriteFile("genesis.json", genesisBytes, 0644); err != nil {
 		log.Fatalf("Failed to write genesis.json: %v", err)
 	}
 

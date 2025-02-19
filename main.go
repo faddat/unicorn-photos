@@ -55,7 +55,7 @@ type TotalBalance struct {
 	Total         string `json:"total_amount"`
 	LiquidUnicorn string `json:"liquid_unicorn"`
 	StakedUnicorn string `json:"staked_unicorn"`
-	TotalUnicorn  string `json:"total_unicorn"`
+	TotalUnicorn  string `json:"total_amount"`
 }
 
 // loadState loads or initializes state
@@ -704,27 +704,54 @@ func shouldUpdateBalances(oldHeight, newHeight int64) bool {
 func updateBalances(accounts []map[string]interface{}, height int64, snapshotDir string) ([]map[string]interface{}, error) {
 	logger.Printf("Starting balance update for %d accounts at height %d", len(accounts), height)
 
-	// Fetch all delegations once at the start
-	logger.Println("Fetching all delegations...")
-	delegationMap := make(map[string]int64)
-	delegations, err := fetchRPC("/cosmos.staking.v1beta1/delegations", "delegations.json.tmp", height, snapshotDir)
-	if err != nil {
-		logger.Printf("Warning: failed to fetch delegations: %v", err)
-	} else {
-		// Build delegation map once
-		for _, del := range delegations {
-			if addr, ok := del["delegator_address"].(string); ok {
-				if shares, ok := del["shares"].(string); ok {
-					amount, err := strconv.ParseInt(shares, 10, 64)
-					if err != nil {
-						continue
+	// Try to load existing balances first
+	var balances []map[string]interface{}
+	processedAddrs := make(map[string]bool)
+
+	// Check all possible balance files in order of preference
+	possibleFiles := []string{
+		filepath.Join(snapshotDir, "balances.json.tmp.tmp"),
+		filepath.Join(snapshotDir, "balances.json.tmp"),
+		filepath.Join(snapshotDir, "balances.json"),
+	}
+
+	var loadedFile string
+	for _, file := range possibleFiles {
+		if data, err := os.ReadFile(file); err == nil {
+			if err := json.Unmarshal(data, &balances); err == nil {
+				loadedFile = file
+				logger.Printf("Successfully loaded %d balances from %s", len(balances), file)
+				// Track which addresses we've already processed
+				for _, bal := range balances {
+					if addr, ok := bal["address"].(string); ok {
+						processedAddrs[addr] = true
 					}
-					delegationMap[addr] += amount
 				}
+				break
+			} else {
+				logger.Printf("Warning: Failed to parse %s: %v", file, err)
 			}
 		}
-		logger.Printf("Found delegations for %d addresses", len(delegationMap))
 	}
+
+	if loadedFile != "" {
+		logger.Printf("Resuming from %d existing balances in %s", len(balances), loadedFile)
+	}
+
+	// Create a list of addresses that still need processing
+	var remainingAddrs []string
+	for _, acc := range accounts {
+		if addr, ok := acc["address"].(string); ok {
+			if !processedAddrs[addr] {
+				remainingAddrs = append(remainingAddrs, addr)
+			}
+		}
+	}
+	logger.Printf("Found %d addresses remaining to process out of %d total", len(remainingAddrs), len(accounts))
+
+	// Count remaining work
+	remainingAddrsCount := len(remainingAddrs)
+	logger.Printf("Found %d addresses remaining to process", remainingAddrsCount)
 
 	// Create buffered channels
 	workers := 100
@@ -732,28 +759,17 @@ func updateBalances(accounts []map[string]interface{}, height int64, snapshotDir
 	jobs := make(chan string, bufferSize)
 	results := make(chan map[string]interface{}, bufferSize)
 
-	// Track progress
-	totalJobs := len(accounts)
-	jobsSent := 0
-	resultsReceived := 0
-	lastProgressLog := time.Now()
-
-	// Start workers with more logging
+	// Start workers
 	var wg sync.WaitGroup
-	logger.Printf("Starting %d balance fetch workers...", workers)
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			logger.Printf("Worker %d started", workerID)
-			jobsProcessed := 0
-
 			for addr := range jobs {
-				jobsProcessed++
-				if jobsProcessed%100 == 0 {
-					logger.Printf("Worker %d has processed %d jobs", workerID, jobsProcessed)
+				// Skip already processed addresses
+				if processedAddrs[addr] {
+					continue
 				}
-
 				url := fmt.Sprintf("https://rest.unicorn.meme/cosmos/bank/v1beta1/balances/%s", addr)
 				resp, err := httpClient.Get(url)
 				if err != nil {
@@ -775,84 +791,42 @@ func updateBalances(accounts []map[string]interface{}, height int64, snapshotDir
 					"coins":   balanceResp.Balances,
 				}
 			}
-			logger.Printf("Worker %d finished after processing %d jobs", workerID, jobsProcessed)
 		}(w)
 	}
 
-	// Send jobs with progress logging
+	// Send jobs
 	go func() {
-		logger.Printf("Starting to send %d jobs to workers...", len(accounts))
-		for _, acc := range accounts {
-			if addr, ok := acc["address"].(string); ok {
-				jobs <- addr
-				jobsSent++
-				if jobsSent%1000 == 0 {
-					logger.Printf("Sent %d/%d jobs to workers (%.2f%%)",
-						jobsSent, totalJobs, float64(jobsSent)/float64(totalJobs)*100)
-				}
-			}
+		for _, addr := range remainingAddrs {
+			jobs <- addr
 		}
-		logger.Printf("All %d jobs sent to workers", jobsSent)
 		close(jobs)
-
-		// Wait for all workers in a separate goroutine
-		go func() {
-			wg.Wait()
-			logger.Println("All workers finished, closing results channel")
-			close(results)
-		}()
+		wg.Wait()
+		close(results)
 	}()
 
-	// Collect results with more progress logging
-	var balances []map[string]interface{}
-	var totalBalances []TotalBalance
-
-	logger.Println("Starting to collect balance results...")
+	// Collect results with periodic saving
+	lastSave := time.Now()
+	processed := 0
 	for result := range results {
-		resultsReceived++
-		addr := result["address"].(string)
-
-		var liquidAmount, stakedAmount int64
-
-		// Fix the type assertion for coins
-		if coinsRaw, ok := result["coins"].([]map[string]interface{}); ok {
-			for _, coin := range coinsRaw {
-				if denom, ok := coin["denom"].(string); ok && denom == "uwunicorn" {
-					if amount, ok := coin["amount"].(string); ok {
-						liquidAmount, _ = strconv.ParseInt(amount, 10, 64)
-					}
-				}
-			}
-		}
-
-		// Get staked balance from pre-built map
-		stakedAmount = delegationMap[addr]
-
-		// Always include in balances, even if zero
 		balances = append(balances, result)
+		processed++
 
-		// Only include non-zero balances in totalBalances for richlist
-		if liquidAmount > 0 || stakedAmount > 0 {
-			totalAmount := liquidAmount + stakedAmount
-			totalBalances = append(totalBalances, TotalBalance{
-				Address:       addr,
-				Liquid:        strconv.FormatInt(liquidAmount, 10),
-				Staked:        strconv.FormatInt(stakedAmount, 10),
-				Total:         strconv.FormatInt(totalAmount, 10),
-				LiquidUnicorn: strconv.FormatFloat(float64(liquidAmount)/1000000, 'f', 6, 64),
-				StakedUnicorn: strconv.FormatFloat(float64(stakedAmount)/1000000, 'f', 6, 64),
-				TotalUnicorn:  strconv.FormatFloat(float64(totalAmount)/1000000, 'f', 6, 64),
-			})
-		}
-
-		if time.Since(lastProgressLog) > 5*time.Second {
-			logger.Printf("Progress: %d/%d balances processed (%.2f%%)",
-				resultsReceived, totalJobs, float64(resultsReceived)/float64(totalJobs)*100)
-			lastProgressLog = time.Now()
+		// Save progress every minute or every 1000 balances
+		if time.Since(lastSave) > time.Minute || processed%1000 == 0 {
+			logger.Printf("Saving progress: %d/%d balances...", len(balances), len(accounts))
+			if err := writeJSONFile("balances.json.tmp", balances, snapshotDir); err != nil {
+				logger.Printf("Warning: Failed to save balance progress: %v", err)
+			}
+			lastSave = time.Now()
 		}
 	}
 
-	logger.Printf("Balance update complete: %d/%d accounts processed", resultsReceived, totalJobs)
+	// Final save
+	if err := writeJSONFile("balances.json", balances, snapshotDir); err != nil {
+		return nil, fmt.Errorf("failed to write final balances: %v", err)
+	}
+
+	logger.Printf("Balance update complete: %d total balances", len(balances))
 	return balances, nil
 }
 
@@ -974,36 +948,24 @@ func updateReadme(height int64, snapshotDir string, balances []map[string]interf
 	return nil
 }
 
-// Add this function to find incomplete snapshots
-func findIncompleteSnapshot() (string, int64, error) {
-	entries, err := os.ReadDir("snapshots")
-	if err != nil && !os.IsNotExist(err) {
-		return "", 0, fmt.Errorf("failed to read snapshots directory: %v", err)
+// Add this function to check if a snapshot is complete
+func isSnapshotComplete(snapshotDir string) bool {
+	requiredFiles := []string{
+		"accounts.json",
+		"balances.json",
+		"validators.json",
+		"state.json",
 	}
 
-	for _, entry := range entries {
-		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "height_") {
-			continue
-		}
-
-		heightStr := strings.TrimPrefix(entry.Name(), "height_")
-		height, err := strconv.ParseInt(heightStr, 10, 64)
-		if err != nil {
-			continue
-		}
-
-		// Check if this snapshot is incomplete
-		snapshotDir := filepath.Join("snapshots", entry.Name())
-		stateFile := filepath.Join(snapshotDir, "state.json")
-		if _, err := os.Stat(stateFile); os.IsNotExist(err) {
-			logger.Printf("Found incomplete snapshot at height %d", height)
-			return snapshotDir, height, nil
+	for _, file := range requiredFiles {
+		if _, err := os.Stat(filepath.Join(snapshotDir, file)); os.IsNotExist(err) {
+			return false
 		}
 	}
-
-	return "", 0, nil
+	return true
 }
 
+// Update main() to handle incomplete snapshots
 func main() {
 	logger.Println("=== Starting Unicorn Snapshot ===")
 	logger.Printf("Block height check...")
@@ -1027,15 +989,15 @@ func main() {
 		logger.Fatalf("Get block height failed: %v", err)
 	}
 
-	// Then check for incomplete snapshots
+	// Check for incomplete snapshots first
 	if incompleteDir, incompleteHeight, err := findIncompleteSnapshot(); err != nil {
 		logger.Printf("Warning: Error checking for incomplete snapshots: %v", err)
 	} else if incompleteDir != "" {
-		logger.Printf("Resuming incomplete snapshot at height %d", incompleteHeight)
+		logger.Printf("Found incomplete snapshot at height %d, completing it first", incompleteHeight)
 		snapshotDir = incompleteDir
-		latestHeight = incompleteHeight
+		latestHeight = incompleteHeight // Use the incomplete snapshot's height
 	} else {
-		// No incomplete snapshots found, create new one
+		// Only create new snapshot if no incomplete ones exist
 		snapshotDir, err = ensureSnapshotDir(latestHeight)
 		if err != nil {
 			logger.Fatalf("Failed to create snapshot directory: %v", err)
@@ -1048,22 +1010,16 @@ func main() {
 		logger.Fatalf("Load state failed: %v", err)
 	}
 
-	// Get latest block height
-	latestHeight, err = getLatestBlockHeight()
-	if err != nil {
-		logger.Fatalf("Get block height failed: %v", err)
+	// Use the height from the incomplete snapshot
+	if state.BlockHeight > 0 {
+		latestHeight = state.BlockHeight
+		logger.Printf("Using existing snapshot height: %d", latestHeight)
 	}
 
 	// Load root accounts first
 	rootAccounts, err := loadRootAccounts()
 	if err != nil {
 		logger.Printf("Warning: Failed to load root accounts: %v", err)
-	}
-
-	// Create snapshot directory
-	snapshotDir, err = ensureSnapshotDir(latestHeight)
-	if err != nil {
-		logger.Fatalf("Failed to create snapshot directory: %v", err)
 	}
 
 	// Use root accounts and fetch only new ones
@@ -1452,4 +1408,32 @@ func updateRootAccounts(accounts []map[string]interface{}) error {
 	}
 	logger.Printf("Updated root accounts.json with %d accounts", len(accounts))
 	return nil
+}
+
+// Update findIncompleteSnapshot to check completion status
+func findIncompleteSnapshot() (string, int64, error) {
+	entries, err := os.ReadDir("snapshots")
+	if err != nil && !os.IsNotExist(err) {
+		return "", 0, fmt.Errorf("failed to read snapshots directory: %v", err)
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "height_") {
+			continue
+		}
+
+		heightStr := strings.TrimPrefix(entry.Name(), "height_")
+		height, err := strconv.ParseInt(heightStr, 10, 64)
+		if err != nil {
+			continue
+		}
+
+		snapshotDir := filepath.Join("snapshots", entry.Name())
+		if !isSnapshotComplete(snapshotDir) {
+			logger.Printf("Found incomplete snapshot at height %d", height)
+			return snapshotDir, height, nil
+		}
+	}
+
+	return "", 0, nil
 }

@@ -449,7 +449,60 @@ func main() {
 
 	// Fetch data
 	data := make(map[string][]map[string]interface{})
-	data["accounts"], _ = fetchRPC("/cosmos.auth.v1beta1/accounts", "accounts.json.tmp", blockHeight)
+
+	// Fetch accounts via REST
+	accountsURL := "https://rest.unicorn.meme/cosmos/auth/v1beta1/accounts"
+	var allAccounts []map[string]interface{}
+	nextKey := ""
+	pageSize := 500
+
+	for {
+		url := accountsURL
+		if nextKey != "" {
+			url = fmt.Sprintf("%s?pagination.key=%s&pagination.limit=%d", accountsURL, nextKey, pageSize)
+		} else {
+			url = fmt.Sprintf("%s?pagination.limit=%d", accountsURL, pageSize)
+		}
+
+		resp, err := httpClient.Get(url)
+		if err != nil {
+			logger.Printf("Failed to fetch accounts: %v", err)
+			break
+		}
+
+		var result struct {
+			Accounts   []map[string]interface{} `json:"accounts"`
+			Pagination struct {
+				NextKey string `json:"next_key"`
+				Total   string `json:"total"`
+			} `json:"pagination"`
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			resp.Body.Close()
+			logger.Printf("Failed to decode accounts: %v", err)
+			break
+		}
+		resp.Body.Close()
+
+		allAccounts = append(allAccounts, result.Accounts...)
+		logger.Printf("Fetched %d accounts (total: %d, expected: %s)",
+			len(result.Accounts), len(allAccounts), result.Pagination.Total)
+
+		// Save progress periodically
+		if len(allAccounts)%1000 == 0 {
+			if err := writeJSONFile("accounts.json", allAccounts); err != nil {
+				logger.Printf("Failed to save progress: %v", err)
+			}
+		}
+
+		if result.Pagination.NextKey == "" {
+			break
+		}
+		nextKey = result.Pagination.NextKey
+	}
+
+	data["accounts"] = allAccounts
 	data["balances"], _ = fetchRPC("/cosmos.bank.v1beta1/balances", "balances.json.tmp", blockHeight)
 	data["validators"], _ = fetchValidators(blockHeight)
 	data["delegations"], _ = fetchRPC("/cosmos.staking.v1beta1/delegations", "delegations.json.tmp", blockHeight)

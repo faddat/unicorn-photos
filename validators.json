@@ -1,1 +1,11 @@
-null
+[
+  {
+    "address": "44822BD3812872E6C3353F5A7B254A8D928C2A79",
+    "proposer_priority": "0",
+    "pub_key": {
+      "type": "tendermint/PubKeyEd25519",
+      "value": "ruN1HIj17pENcWjBUG7XqkJtDSsOCpIk4S2MeTz7z7g="
+    },
+    "voting_power": "534005430"
+  }
+]

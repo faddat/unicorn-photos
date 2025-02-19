@@ -261,7 +261,7 @@ func main() {
 	var mu sync.Mutex
 
 	// Create rate limiter to prevent overwhelming the API
-	rateLimit := time.NewTicker(time.Microsecond * 2000) // 20 requests per second
+	rateLimit := time.NewTicker(time.Microsecond * 5000) // 20 requests per second
 	defer rateLimit.Stop()
 
 	// Start worker goroutines

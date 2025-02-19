@@ -159,6 +159,12 @@ func fetchAll(endpoint, itemsKey string, state *State) ([]map[string]interface{}
 		return nil, fmt.Errorf("unexpected total type: %T", pagination["total"])
 	}
 
+	if total == 0 {
+		// No new items to fetch, return existing items
+		fmt.Printf("No new %s to fetch\n", itemsKey)
+		return existingItems, nil
+	}
+
 	pageSize := 100
 	numPages := (total + pageSize - 1) / pageSize
 
@@ -172,7 +178,7 @@ func fetchAll(endpoint, itemsKey string, state *State) ([]map[string]interface{}
 	workers := 50
 	jobs := make(chan int, numPages)
 	results := make(chan pageResult, numPages)
-	rateLimit := time.NewTicker(time.Millisecond * 20) // 50 requests per second
+	rateLimit := time.NewTicker(time.Millisecond * 20)
 	defer rateLimit.Stop()
 
 	// Start workers
@@ -182,11 +188,9 @@ func fetchAll(endpoint, itemsKey string, state *State) ([]map[string]interface{}
 				<-rateLimit.C
 				var pageURL string
 				if itemsKey == "accounts" {
-					// For accounts, increment the account_number_gt parameter
 					pageURL = fmt.Sprintf("%s/cosmos/auth/v1beta1/accounts?account_number_gt=%d&pagination.limit=%d",
 						REST_URL, lastAccountNum+(int64(page)*int64(pageSize)), pageSize)
 				} else {
-					// For other endpoints, use offset-based pagination
 					pageURL = fmt.Sprintf("%s?pagination.limit=%d&pagination.offset=%d",
 						baseURL, pageSize, page*pageSize)
 				}

@@ -428,6 +428,149 @@ func writeJSONFile(filename string, data interface{}) error {
 	return nil
 }
 
+// Add this function to sort and validate accounts
+func processAccounts(accounts []map[string]interface{}) ([]map[string]interface{}, error) {
+	if len(accounts) == 0 {
+		return nil, fmt.Errorf("no accounts to process")
+	}
+
+	// Convert to a map keyed by account number for deduplication and sorting
+	accountMap := make(map[int64]map[string]interface{})
+	var maxAccNum int64 = -1
+
+	for _, acc := range accounts {
+		numStr, ok := acc["account_number"].(string)
+		if !ok {
+			continue // Skip accounts without account number
+		}
+		num, err := strconv.ParseInt(numStr, 10, 64)
+		if err != nil {
+			continue // Skip invalid account numbers
+		}
+		accountMap[num] = acc
+		if num > maxAccNum {
+			maxAccNum = num
+		}
+	}
+
+	// Check for gaps and log missing account numbers
+	var missingNums []int64
+	for i := int64(0); i <= maxAccNum; i++ {
+		if _, exists := accountMap[i]; !exists {
+			missingNums = append(missingNums, i)
+		}
+	}
+
+	if len(missingNums) > 0 {
+		return nil, fmt.Errorf("missing account numbers: %v", missingNums)
+	}
+
+	// Sort accounts by account number
+	sorted := make([]map[string]interface{}, maxAccNum+1)
+	for i := int64(0); i <= maxAccNum; i++ {
+		acc, exists := accountMap[i]
+		if !exists {
+			return nil, fmt.Errorf("missing account number %d", i)
+		}
+		sorted[i] = acc
+	}
+
+	return sorted, nil
+}
+
+// Add this function to handle balance updates
+func updateBalances(accounts []map[string]interface{}, height int64) ([]map[string]interface{}, error) {
+	logger.Printf("Updating balances at height %d", height)
+	balances := make([]map[string]interface{}, 0, len(accounts))
+
+	// Create channels for parallel processing
+	type balanceResult struct {
+		balance map[string]interface{}
+		err     error
+		addr    string
+	}
+
+	workers := 50
+	jobs := make(chan string, workers*2)
+	results := make(chan balanceResult, workers*2)
+
+	// Start workers
+	for w := 0; w < workers; w++ {
+		go func() {
+			for addr := range jobs {
+				url := fmt.Sprintf("https://rest.unicorn.meme/cosmos/bank/v1beta1/balances/%s", addr)
+				resp, err := httpClient.Get(url)
+				if err != nil {
+					results <- balanceResult{err: err, addr: addr}
+					continue
+				}
+
+				var result struct {
+					Balances []map[string]interface{} `json:"balances"`
+				}
+				if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+					resp.Body.Close()
+					results <- balanceResult{err: err, addr: addr}
+					continue
+				}
+				resp.Body.Close()
+
+				if len(result.Balances) > 0 {
+					results <- balanceResult{
+						balance: map[string]interface{}{
+							"address": addr,
+							"coins":   result.Balances,
+						},
+					}
+				}
+			}
+		}()
+	}
+
+	// Send jobs
+	go func() {
+		for _, acc := range accounts {
+			if addr, ok := acc["address"].(string); ok {
+				jobs <- addr
+			}
+		}
+		close(jobs)
+	}()
+
+	// Collect results
+	processed := 0
+	total := len(accounts)
+	lastLog := time.Now()
+	for result := range results {
+		processed++
+		if result.err != nil {
+			logger.Printf("Error fetching balance for %s: %v", result.addr, result.err)
+			continue
+		}
+		if result.balance != nil {
+			balances = append(balances, result.balance)
+		}
+
+		// Log progress every 5 seconds
+		if time.Since(lastLog) > 5*time.Second {
+			logger.Printf("Progress: %d/%d balances fetched (%.2f%%)",
+				processed, total, float64(processed)/float64(total)*100)
+			lastLog = time.Now()
+		}
+
+		if processed >= total {
+			break
+		}
+	}
+
+	// Save balances
+	if err := writeJSONFile("balances.json", balances); err != nil {
+		return nil, fmt.Errorf("failed to save balances: %v", err)
+	}
+
+	return balances, nil
+}
+
 // Add this function
 func validateAccounts(filename string) (bool, int64) {
 	logger.Printf("Validating %s...", filename)
@@ -576,8 +719,29 @@ func main() {
 		}
 	}
 
-	data["accounts"] = allAccounts
-	data["balances"], _ = fetchRPC("/cosmos.bank.v1beta1/balances", "balances.json.tmp", latestHeight)
+	// Process accounts
+	if allAccounts, err = processAccounts(allAccounts); err != nil {
+		logger.Fatalf("Failed to process accounts: %v", err)
+	}
+
+	// Update balances if needed
+	if shouldUpdateBalances(state.BlockHeight, latestHeight) {
+		data["balances"], err = updateBalances(allAccounts, latestHeight)
+		if err != nil {
+			logger.Fatalf("Failed to update balances: %v", err)
+		}
+	} else {
+		// Load existing balances
+		var balances []map[string]interface{}
+		if balanceData, err := os.ReadFile("balances.json"); err == nil {
+			if err := json.Unmarshal(balanceData, &balances); err != nil {
+				logger.Fatalf("Failed to parse balances.json: %v", err)
+			}
+			data["balances"] = balances
+			logger.Printf("Using existing balances from height %d", state.BlockHeight)
+		}
+	}
+
 	data["validators"], _ = fetchValidators(latestHeight)
 	data["delegations"], _ = fetchRPC("/cosmos.staking.v1beta1/delegations", "delegations.json.tmp", latestHeight)
 	data["denom_metadata"], _ = fetchRPC("/cosmos.bank.v1beta1/denoms_metadata", "metadatas.json.tmp", latestHeight)

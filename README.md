@@ -68,3 +68,10 @@ Latest snapshot from block height: (Will be updated by daemon)
 * snapshot a specific block height
 * snapshot a specific solana block height
 * 
+
+## Snapshot 11794277
+
+- Height: 11794277
+- Time: 2025-02-20T09:39:31Z
+- Path: snapshots/height_11794277
+- Total Supply: 67940412438764700 uwunicorn (67940412438.764702 UNICORN)

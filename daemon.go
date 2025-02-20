@@ -8,15 +8,13 @@ import (
 	"os"
 	"path/filepath"
 	"time"
-
-	shell "github.com/ipfs/go-ipfs-api"
 )
 
 type IPFSSnapshot struct {
-	Height    int64     `json:"height"`
-	Time      time.Time `json:"time"`
-	Path      string    `json:"path"`
-	IPFSCID   string    `json:"ipfs_cid"`
+	Height  int64     `json:"height"`
+	Time    time.Time `json:"time"`
+	Path    string    `json:"path"`
+	IPFSCID string    `json:"ipfs_cid"`
 }
 
 type SnapshotIndex struct {
@@ -25,8 +23,13 @@ type SnapshotIndex struct {
 }
 
 func runDaemon(ctx context.Context) error {
-	// Create IPFS shell
-	sh := shell.NewShell("localhost:5001")
+	// Create IPFS node
+	ipfsPath := filepath.Join(os.Getenv("HOME"), ".unicorn-photos", "ipfs")
+	node, err := createNode(ctx, ipfsPath)
+	if err != nil {
+		return fmt.Errorf("failed to create IPFS node: %v", err)
+	}
+	defer node.Close()
 
 	// Create snapshots directory if it doesn't exist
 	if err := os.MkdirAll("snapshots", 0755); err != nil {
@@ -44,7 +47,7 @@ func runDaemon(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			if err := takeAndUploadSnapshot(sh, &index); err != nil {
+			if err := takeAndUploadSnapshot(node, &index); err != nil {
 				log.Printf("Failed to take snapshot: %v", err)
 				continue
 			}
@@ -77,7 +80,7 @@ func saveSnapshotIndex(index SnapshotIndex) error {
 	return os.WriteFile("snapshots/index.json", data, 0644)
 }
 
-func takeAndUploadSnapshot(sh *shell.Shell, index *SnapshotIndex) error {
+func takeAndUploadSnapshot(node *IPFSNode, index *SnapshotIndex) error {
 	// Get latest block height
 	height, err := getLatestBlockHeight()
 	if err != nil {
@@ -91,12 +94,12 @@ func takeAndUploadSnapshot(sh *shell.Shell, index *SnapshotIndex) error {
 	}
 
 	// Take snapshot using existing functionality
-	if err := takeSnapshot(height); err != nil {
+	if err := takeSnapshotCore(height); err != nil {
 		return fmt.Errorf("failed to take snapshot: %v", err)
 	}
 
 	// Add snapshot directory to IPFS
-	cid, err := sh.AddDir(snapshotDir)
+	cid, err := node.AddPath(snapshotDir)
 	if err != nil {
 		return fmt.Errorf("failed to add snapshot to IPFS: %v", err)
 	}
@@ -111,12 +114,12 @@ func takeAndUploadSnapshot(sh *shell.Shell, index *SnapshotIndex) error {
 	index.Snapshots = append(index.Snapshots, snapshot)
 
 	// Add index to IPFS
-	indexData, err := json.MarshalIndent(index, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal index: %v", err)
+	indexFile := filepath.Join("snapshots", "index.json")
+	if err := saveSnapshotIndex(*index); err != nil {
+		return fmt.Errorf("failed to save index: %v", err)
 	}
 
-	rootCID, err := sh.Add(indexData)
+	rootCID, err := node.AddPath(indexFile)
 	if err != nil {
 		return fmt.Errorf("failed to add index to IPFS: %v", err)
 	}
@@ -133,12 +136,15 @@ func takeAndUploadSnapshot(sh *shell.Shell, index *SnapshotIndex) error {
 func updateReadmeWithIPFS(index SnapshotIndex) error {
 	readmeTemplate := `# unicorn photos
 
-Code and output for a bespoke snapshot utility for Unicorn and Memes.  
+Code and output for a bespoke snapshot utility for Unicorn and Memes that automatically takes snapshots every 4 hours and stores them on IPFS.
 
 ## Usage
 
-` + "```" + `go
+` + "```" + `bash
+# Install
 go install ./...
+
+# Run
 unicorn-photos
 ` + "```" + `
 
@@ -152,8 +158,9 @@ Latest snapshot index CID: %s
 
 ## Current Features
 
+- Embedded IPFS node
 - Automatic snapshots every 4 hours
-- IPFS integration for decentralized snapshot storage
+- Decentralized snapshot storage
 - Cosmos-SDK v0.50.x compatible genesis.json generation
 
 ## Purpose
@@ -188,9 +195,3 @@ func max(a, b int) int {
 	}
 	return b
 }
-
-func takeSnapshot(height int64) error {
-	// This function should implement the snapshot logic from main.go
-	// You'll need to refactor the existing snapshot code to be callable from here
-	return nil
-} 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -985,266 +986,25 @@ func isSnapshotComplete(snapshotDir string) bool {
 
 // Update main() to handle incomplete snapshots
 func main() {
-	logger.Println("=== Starting Unicorn Snapshot ===")
-	logger.Printf("Block height check...")
-
-	// Initialize variables
-	data := make(map[string][]map[string]interface{})
-	var accounts []map[string]interface{}
-	var snapshotDir string
-	var err error
-
-	var newPrefix string
-	flag.StringVar(&newPrefix, "prefix", "unicorn", "New Bech32 prefix (default: unicorn)")
-	var force bool
-	flag.BoolVar(&force, "force", false, "Force re-collection of data even if height is complete")
+	daemonMode := flag.Bool("daemon", false, "Run in daemon mode")
 	flag.Parse()
-	logger.Printf("Using Bech32 prefix: %s", newPrefix)
 
-	// Get latest block height first
-	latestHeight, err := getLatestBlockHeight()
+	if *daemonMode {
+		ctx := context.Background()
+		if err := runDaemon(ctx); err != nil {
+			log.Fatalf("Daemon error: %v", err)
+		}
+		return
+	}
+
+	// Take a single snapshot
+	height, err := getLatestBlockHeight()
 	if err != nil {
-		logger.Fatalf("Get block height failed: %v", err)
+		log.Fatalf("Failed to get latest block height: %v", err)
 	}
 
-	// Check for incomplete snapshots first
-	if incompleteDir, incompleteHeight, err := findIncompleteSnapshot(); err != nil {
-		logger.Printf("Warning: Error checking for incomplete snapshots: %v", err)
-	} else if incompleteDir != "" {
-		logger.Printf("Found incomplete snapshot at height %d, completing it first", incompleteHeight)
-		snapshotDir = incompleteDir
-		latestHeight = incompleteHeight // Use the incomplete snapshot's height
-	} else {
-		// Only create new snapshot if no incomplete ones exist
-		snapshotDir, err = ensureSnapshotDir(latestHeight)
-		if err != nil {
-			logger.Fatalf("Failed to create snapshot directory: %v", err)
-		}
-	}
-
-	// Load state from snapshot directory
-	state, err := loadState(snapshotDir)
-	if err != nil {
-		logger.Fatalf("Load state failed: %v", err)
-	}
-
-	// Use the height from the incomplete snapshot
-	if state.BlockHeight > 0 {
-		latestHeight = state.BlockHeight
-		logger.Printf("Using existing snapshot height: %d", latestHeight)
-	}
-
-	// Load root accounts first
-	rootAccounts, err := loadRootAccounts()
-	if err != nil {
-		logger.Printf("Warning: Failed to load root accounts: %v", err)
-	}
-
-	// Use root accounts and fetch only new ones
-	if rootAccounts != nil {
-		accounts = rootAccounts
-		missingNums, err := findMissingAndNewAccounts(accounts)
-		if err != nil {
-			logger.Printf("Warning: Error checking for missing accounts: %v", err)
-		} else if len(missingNums) > 0 {
-			logger.Printf("Fetching %d new accounts...", len(missingNums))
-			newAccounts, err := fetchMissingAccounts(missingNums, latestHeight)
-			if err != nil {
-				logger.Printf("Warning: Failed to fetch new accounts: %v", err)
-			} else {
-				accounts = append(accounts, newAccounts...)
-				if err := updateRootAccounts(accounts); err != nil {
-					logger.Printf("Warning: %v", err)
-				}
-			}
-		}
-	} else {
-		// No root accounts.json, fetch everything
-		accounts, err = fetchAccountsParallel()
-		if err != nil {
-			logger.Fatalf("Failed to fetch accounts: %v", err)
-		}
-		if err := updateRootAccounts(accounts); err != nil {
-			logger.Printf("Warning: %v", err)
-		}
-	}
-
-	// Process accounts
-	if accounts, err = processAccounts(accounts); err != nil {
-		logger.Fatalf("Failed to process accounts: %v", err)
-	}
-	data["accounts"] = accounts
-
-	// Update balances if needed
-	if shouldUpdateBalances(state.BlockHeight, latestHeight) {
-		data["balances"], err = updateBalances(accounts, latestHeight, snapshotDir)
-		if err != nil {
-			logger.Fatalf("Failed to update balances: %v", err)
-		}
-	} else {
-		// Load existing balances
-		var balances []map[string]interface{}
-		balancesFile := filepath.Join(snapshotDir, "balances.json")
-		if balanceData, err := os.ReadFile(balancesFile); err == nil {
-			if err := json.Unmarshal(balanceData, &balances); err != nil {
-				logger.Fatalf("Failed to parse balances.json: %v", err)
-			}
-			data["balances"] = balances
-			logger.Printf("Using existing balances from height %d", state.BlockHeight)
-		}
-	}
-
-	// Generate richlist
-	if len(data["balances"]) > 0 {
-		logger.Println("=== Generating Richlist ===")
-		var totalBalances []TotalBalance
-		balances := data["balances"]
-		for _, bal := range balances {
-			addr, ok := bal["address"].(string)
-			if !ok {
-				continue
-			}
-			coinsRaw, ok := bal["coins"].([]interface{})
-			if !ok {
-				continue
-			}
-
-			var liquidAmount, stakedAmount int64
-			for _, c := range coinsRaw {
-				coin, ok := c.(map[string]interface{})
-				if !ok {
-					continue
-				}
-				if denom, ok := coin["denom"].(string); ok && denom == "uwunicorn" {
-					if amount, ok := coin["amount"].(string); ok {
-						liquidAmount, _ = strconv.ParseInt(amount, 10, 64)
-					}
-				}
-			}
-
-			totalAmount := liquidAmount + stakedAmount
-			if liquidAmount > 0 || stakedAmount > 0 {
-				totalBalances = append(totalBalances, TotalBalance{
-					Address:       addr,
-					Liquid:        strconv.FormatInt(liquidAmount, 10),
-					Staked:        strconv.FormatInt(stakedAmount, 10),
-					Total:         strconv.FormatInt(totalAmount, 10),
-					LiquidUnicorn: strconv.FormatFloat(float64(liquidAmount)/1000000, 'f', 6, 64),
-					StakedUnicorn: strconv.FormatFloat(float64(stakedAmount)/1000000, 'f', 6, 64),
-					TotalUnicorn:  strconv.FormatFloat(float64(totalAmount)/1000000, 'f', 6, 64),
-				})
-			}
-		}
-
-		if err := generateRichlist(totalBalances, snapshotDir); err != nil {
-			logger.Printf("Warning: Failed to generate richlist: %v", err)
-		}
-	}
-
-	logger.Println("=== Fetching Validators ===")
-	data["validators"], err = fetchValidators(latestHeight, snapshotDir)
-	if err != nil {
-		logger.Printf("Warning: validator fetch failed: %v", err)
-	}
-	logger.Printf("Found %d validators", len(data["validators"]))
-
-	logger.Println("=== Fetching Delegations ===")
-	data["delegations"], err = fetchRPC("/cosmos.staking.v1beta1/delegations", "delegations.json.tmp", latestHeight, snapshotDir)
-	if err != nil {
-		logger.Printf("Warning: delegations fetch failed: %v", err)
-	}
-	logger.Printf("Found %d delegations", len(data["delegations"]))
-
-	logger.Println("=== Fetching Denom Metadata ===")
-	data["denom_metadata"], err = fetchRPC("/cosmos.bank.v1beta1/denoms_metadata", "metadatas.json.tmp", latestHeight, snapshotDir)
-	if err != nil {
-		logger.Printf("Warning: metadata fetch failed: %v", err)
-	}
-	logger.Printf("Found %d denom metadata entries", len(data["denom_metadata"]))
-
-	// Fetch parameters
-	logger.Println("=== Fetching Module Parameters ===")
-	params := make(map[string]map[string]interface{})
-	for _, module := range []string{"auth", "bank", "staking", "distribution", "gov"} {
-		logger.Printf("Fetching %s parameters...", module)
-		params[module], err = fetchParamsRPC(module, latestHeight, snapshotDir)
-		if err != nil {
-			logger.Printf("Warning: %s params fetch failed: %v", module, err)
-		}
-		// Write each module's params to the snapshot directory
-		if err := writeJSONFile(fmt.Sprintf("%s_params.json", module), params[module], snapshotDir); err != nil {
-			logger.Printf("Warning: Failed to write %s params to snapshot: %v", module, err)
-		}
-	}
-
-	// Construct genesis
-	logger.Println("=== Constructing Genesis File ===")
-	logger.Printf("Creating genesis state at height %d", latestHeight)
-	genesis := map[string]interface{}{
-		"genesis_time":   time.Now().UTC().Format(time.RFC3339),
-		"chain_id":       "unicorn-snapshot",
-		"initial_height": "1",
-		"app_state": map[string]interface{}{
-			"auth": map[string]interface{}{
-				"params":   params["auth"],
-				"accounts": data["accounts"],
-			},
-			"bank": map[string]interface{}{
-				"params":         params["bank"],
-				"balances":       data["balances"],
-				"denom_metadata": data["denom_metadata"],
-			},
-			"staking": map[string]interface{}{
-				"params":      params["staking"],
-				"validators":  data["validators"],
-				"delegations": data["delegations"],
-			},
-			"distribution": map[string]interface{}{"params": params["distribution"]},
-			"gov":          map[string]interface{}{"params": params["gov"]},
-		},
-	}
-
-	// Convert Bech32 prefix
-	oldPrefix := "cosmos"
-	if len(data["accounts"]) > 0 {
-		if addr, ok := data["accounts"][0]["address"].(string); ok {
-			if hrp, _, err := bech32.Decode(addr); err == nil {
-				oldPrefix = hrp
-			}
-		}
-	}
-	logger.Println("=== Converting Addresses ===")
-	logger.Printf("Converting from prefix '%s' to '%s'", oldPrefix, newPrefix)
-	convertAddresses(genesis["app_state"].(map[string]interface{}), oldPrefix, newPrefix)
-
-	// Write genesis to snapshot directory only
-	logger.Println("Writing genesis.json to snapshot directory...")
-	if err := writeJSONFile("genesis.json", genesis, snapshotDir); err != nil {
-		logger.Printf("Warning: Failed to write genesis.json to snapshot: %v", err)
-	}
-
-	// After constructing the genesis file, add:
-	// After fetching balances, save state again
-	if err := saveState(state, true, snapshotDir); err != nil {
-		logger.Printf("Failed to save final state: %v", err)
-	}
-
-	// Clean up at the end
-	defer cleanupAllTempFiles(snapshotDir)
-
-	logger.Println("=== Snapshot Complete ===")
-	logger.Printf("Final block height: %d", latestHeight)
-	logger.Printf("Total accounts: %d", len(data["accounts"]))
-	logger.Printf("Total balances: %d", len(data["balances"]))
-	logger.Printf("Total validators: %d", len(data["validators"]))
-	logger.Printf("Total delegations: %d", len(data["delegations"]))
-	logger.Printf("Total metadata entries: %d", len(data["denom_metadata"]))
-	logger.Println("Snapshot completed!")
-	fmt.Println("Snapshot completed!")
-
-	// Update README after successful snapshot
-	if err := updateReadme(latestHeight, snapshotDir, data["balances"]); err != nil {
-		logger.Printf("Warning: %v", err)
+	if err := takeSnapshot(height); err != nil {
+		log.Fatalf("Failed to take snapshot: %v", err)
 	}
 }
 
@@ -1446,4 +1206,37 @@ func findIncompleteSnapshot() (string, int64, error) {
 	}
 
 	return "", 0, nil
+}
+
+func takeSnapshot(height int64) error {
+	snapshotDir, err := ensureSnapshotDir(height)
+	if err != nil {
+		return fmt.Errorf("failed to create snapshot directory: %v", err)
+	}
+
+	state, err := loadState(snapshotDir)
+	if err != nil {
+		return fmt.Errorf("failed to load state: %v", err)
+	}
+
+	// Fetch accounts and balances
+	accounts, err := fetchAccountsParallel()
+	if err != nil {
+		return fmt.Errorf("failed to fetch accounts: %v", err)
+	}
+
+	balances, err := updateBalances(accounts, height, snapshotDir)
+	if err != nil {
+		return fmt.Errorf("failed to update balances: %v", err)
+	}
+
+	// Save final state
+	state.BlockHeight = height
+	state.AccountsComplete = true
+	state.BalancesComplete = true
+	if err := saveState(state, true, snapshotDir); err != nil {
+		return fmt.Errorf("failed to save final state: %v", err)
+	}
+
+	return nil
 }

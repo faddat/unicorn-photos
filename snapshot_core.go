@@ -27,6 +27,11 @@ func takeSnapshotCore(height int64) error {
 		return fmt.Errorf("failed to update balances: %v", err)
 	}
 
+	// Export blockchain state modules
+	if err := exportBlockchainState(height, snapshotDir); err != nil {
+		return fmt.Errorf("failed to export blockchain state: %v", err)
+	}
+
 	// Save final state
 	state.BlockHeight = height
 	state.AccountsComplete = true

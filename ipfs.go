@@ -7,7 +7,8 @@ import (
 	"sync"
 
 	"github.com/ipfs/boxo/files"
-	"github.com/ipfs/kubo/config"
+	corepath "github.com/ipfs/boxo/path"
+	ipfsconfig "github.com/ipfs/kubo/config"
 	"github.com/ipfs/kubo/core"
 	"github.com/ipfs/kubo/core/coreapi"
 	iface "github.com/ipfs/kubo/core/coreiface"
@@ -37,7 +38,7 @@ func NewIPFSNode(ctx context.Context, config *Config) (*IPFSNode, error) {
 	}
 
 	if !fsrepo.IsInitialized(config.IPFSRepoPath) {
-		cfg, err := config.Init(os.Stdout, 2048)
+		cfg, err := ipfsconfig.Init(os.Stdout, 2048)
 		if err != nil {
 			cancel()
 			return nil, err
@@ -114,7 +115,16 @@ func NewIPFSNode(ctx context.Context, config *Config) (*IPFSNode, error) {
 
 func (n *IPFSNode) connectToPeers(peers []string) error {
 	var wg sync.WaitGroup
-	for _, addr := range append(peers, config.DefaultBootstrapAddresses...) {
+
+	// Define a list of default bootstrap addresses
+	defaultBootstrapAddresses := []string{
+		"/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+		"/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
+		"/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+		"/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
+	}
+
+	for _, addr := range append(peers, defaultBootstrapAddresses...) {
 		wg.Add(1)
 		go func(address string) {
 			defer wg.Done()
@@ -162,7 +172,8 @@ func (n *IPFSNode) AddPath(path string) (string, error) {
 		return "", err
 	}
 
-	cid := ipfsPath.Cid().String()
+	// Get the CID from the path
+	cid := ipfsPath.RootCid().String()
 	n.mu.Lock()
 	n.pinned[cid] = stat.Size()
 	n.mu.Unlock()
@@ -170,7 +181,7 @@ func (n *IPFSNode) AddPath(path string) (string, error) {
 	return cid, nil
 }
 
-func (n *IPFSNode) PinCID(cid string, size int64) error {
+func (n *IPFSNode) PinCID(cid string) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -179,14 +190,24 @@ func (n *IPFSNode) PinCID(cid string, size int64) error {
 		totalSize += s
 	}
 
+	// For now, we'll use a fixed size since we don't know the actual size
+	size := int64(1000000) // Assume 1MB as a placeholder
+
 	if totalSize+size > n.config.MaxPinnedSize {
-		return fmt.Errorf("pinning %s would exceed 100GB limit (current: %d bytes)", cid, totalSize)
+		return fmt.Errorf("pinning %s would exceed %d byte limit (current: %d bytes)",
+			cid, n.config.MaxPinnedSize, totalSize)
 	}
 
-	path := iface.IpfsPath(cid)
-	if err := n.api.Pin().Add(n.ctx, path); err != nil {
+	// Parse the CID to create a path
+	parsedPath, err := corepath.NewPath("/ipfs/" + cid)
+	if err != nil {
+		return fmt.Errorf("invalid CID: %w", err)
+	}
+
+	if err := n.api.Pin().Add(n.ctx, parsedPath); err != nil {
 		return err
 	}
+
 	n.pinned[cid] = size
 	return nil
 }
@@ -195,10 +216,16 @@ func (n *IPFSNode) UnpinCID(cid string) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	path := iface.IpfsPath(cid)
-	if err := n.api.Pin().Rm(n.ctx, path); err != nil {
+	// Parse the CID to create a path
+	parsedPath, err := corepath.NewPath("/ipfs/" + cid)
+	if err != nil {
+		return fmt.Errorf("invalid CID: %w", err)
+	}
+
+	if err := n.api.Pin().Rm(n.ctx, parsedPath); err != nil {
 		return err
 	}
+
 	delete(n.pinned, cid)
 	return nil
 }

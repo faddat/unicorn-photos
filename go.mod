@@ -3,7 +3,6 @@ module github.com/faddat/unicorn-photos
 go 1.24
 
 require (
-	github.com/btcsuite/btcutil v1.0.2
 	github.com/ipfs/boxo v0.18.0
 	github.com/ipfs/kubo v0.26.0
 	github.com/libp2p/go-libp2p v0.32.2

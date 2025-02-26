@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -244,80 +243,6 @@ func getDirSize(path string) (int64, error) {
 		return nil
 	})
 	return size, err
-}
-
-func takeAndUploadSnapshot(node *IPFSNode, index *SnapshotIndex, config *Config) error {
-	height, err := getLatestBlockHeight()
-	if err != nil {
-		return fmt.Errorf("failed to get latest block height: %v", err)
-	}
-
-	snapshotDir, err := ensureSnapshotDir(height)
-	if err != nil {
-		return fmt.Errorf("failed to create snapshot directory: %v", err)
-	}
-
-	if err := takeSnapshotCore(height); err != nil {
-		return fmt.Errorf("failed to take snapshot: %v", err)
-	}
-
-	stat, err := os.Stat(snapshotDir)
-	if err != nil {
-		return fmt.Errorf("failed to get snapshot size: %v", err)
-	}
-
-	cid, err := node.AddPath(snapshotDir)
-	if err != nil {
-		return fmt.Errorf("failed to add snapshot to IPFS: %v", err)
-	}
-
-	snapshot := IPFSSnapshot{
-		Height:  height,
-		Time:    time.Now(),
-		Path:    snapshotDir,
-		IPFSCID: cid,
-		Size:    stat.Size(),
-	}
-	index.Snapshots = append(index.Snapshots, snapshot)
-
-	indexFile := filepath.Join(config.SnapshotDir, "index.json")
-	if err := saveSnapshotIndex(*index, config); err != nil {
-		return fmt.Errorf("failed to save index: %v", err)
-	}
-
-	rootCID, err := node.AddPath(indexFile)
-	if err != nil {
-		return fmt.Errorf("failed to add index to IPFS: %v", err)
-	}
-
-	index.RootCID = rootCID
-	if err := saveSnapshotIndex(*index, config); err != nil {
-		return fmt.Errorf("failed to save index: %v", err)
-	}
-
-	return updateReadmeWithIPFS(*index, config)
-}
-
-func cleanupOldSnapshots(index *SnapshotIndex, config *Config) {
-	if len(index.Snapshots) <= config.MaxSnapshotsToKeep {
-		return
-	}
-
-	sort.Slice(index.Snapshots, func(i, j int) bool {
-		return index.Snapshots[i].Time.Before(index.Snapshots[j].Time)
-	})
-
-	for len(index.Snapshots) > config.MaxSnapshotsToKeep {
-		oldest := index.Snapshots[0]
-		if err := os.RemoveAll(oldest.Path); err != nil {
-			log.Printf("Failed to remove old snapshot %s: %v", oldest.Path, err)
-		}
-		index.Snapshots = index.Snapshots[1:]
-	}
-
-	if err := saveSnapshotIndex(*index, config); err != nil {
-		log.Printf("Failed to save updated index: %v", err)
-	}
 }
 
 // nolint:unused

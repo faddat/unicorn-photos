@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
 	"sync"
 
 	"github.com/ipfs/boxo/files"
@@ -24,67 +23,57 @@ type IPFSNode struct {
 	api    iface.CoreAPI
 	ctx    context.Context
 	cancel context.CancelFunc
+	config *Config
+	pinned map[string]int64 // CID -> Size in bytes
+	mu     sync.Mutex
 }
 
-// Creates and returns a new IPFS node
-func createNode(ctx context.Context, repoPath string) (*IPFSNode, error) {
-	// Create a cancellable context
+func NewIPFSNode(ctx context.Context, config *Config) (*IPFSNode, error) {
 	ctx, cancel := context.WithCancel(ctx)
 
-	// Create the repo path if it doesn't exist
-	if err := os.MkdirAll(repoPath, 0755); err != nil {
+	if err := os.MkdirAll(config.IPFSRepoPath, 0755); err != nil {
 		cancel()
 		return nil, err
 	}
 
-	// Check if repo needs to be initialized
-	if !fsrepo.IsInitialized(repoPath) {
+	if !fsrepo.IsInitialized(config.IPFSRepoPath) {
 		cfg, err := config.Init(os.Stdout, 2048)
 		if err != nil {
 			cancel()
 			return nil, err
 		}
-
-		// Configure the node
 		cfg.Addresses.Swarm = []string{
 			"/ip4/0.0.0.0/tcp/4001",
 			"/ip4/0.0.0.0/tcp/4002/ws",
 		}
 		cfg.Addresses.API = []string{"/ip4/127.0.0.1/tcp/5001"}
 		cfg.Addresses.Gateway = []string{"/ip4/127.0.0.1/tcp/8080"}
-
-		// Initialize the repo
-		if err := fsrepo.Init(repoPath, cfg); err != nil {
+		if err := fsrepo.Init(config.IPFSRepoPath, cfg); err != nil {
 			cancel()
 			return nil, fmt.Errorf("failed to init repo: %s", err)
 		}
 	}
 
-	// Open the repo
-	repo, err := fsrepo.Open(repoPath)
+	repo, err := fsrepo.Open(config.IPFSRepoPath)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
 
-	// Load plugins if any
 	plugins, err := loader.NewPluginLoader("")
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("error loading plugins: %s", err)
 	}
-
 	if err := plugins.Initialize(); err != nil {
 		cancel()
 		return nil, fmt.Errorf("error initializing plugins: %s", err)
 	}
-
 	if err := plugins.Inject(); err != nil {
 		cancel()
 		return nil, fmt.Errorf("error injecting plugins: %s", err)
 	}
 
-	// Create the node
 	nodeOptions := &node.BuildCfg{
 		Online: true,
 		Repo:   repo,
@@ -95,68 +84,59 @@ func createNode(ctx context.Context, repoPath string) (*IPFSNode, error) {
 		},
 	}
 
-	node, err := core.NewNode(ctx, nodeOptions)
+	n, err := core.NewNode(ctx, nodeOptions)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
 
-	// Create the CoreAPI
-	api, err := coreapi.NewCoreAPI(node)
+	api, err := coreapi.NewCoreAPI(n)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
 
-	// Connect to bootstrap nodes
-	if err := connectToBootstrapNodes(ctx, node); err != nil {
-		logger.Printf("Warning: failed to connect to bootstrap nodes: %s", err)
-	}
-
-	return &IPFSNode{
-		node:   node,
+	node := &IPFSNode{
+		node:   n,
 		api:    api,
 		ctx:    ctx,
 		cancel: cancel,
-	}, nil
-}
-
-// Connects to the default IPFS bootstrap nodes
-func connectToBootstrapNodes(ctx context.Context, node *core.IpfsNode) error {
-	var bootstrapNodes = []string{
-		"/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
-		"/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
-		"/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+		config: config,
+		pinned: make(map[string]int64),
 	}
 
+	if err := node.connectToPeers(config.BootstrapPeers); err != nil {
+		logger.Printf("Warning: failed to connect to peers: %s", err)
+	}
+
+	return node, nil
+}
+
+func (n *IPFSNode) connectToPeers(peers []string) error {
 	var wg sync.WaitGroup
-	for _, addr := range bootstrapNodes {
+	for _, addr := range append(peers, config.DefaultBootstrapAddresses...) {
 		wg.Add(1)
 		go func(address string) {
 			defer wg.Done()
 			targetAddr, err := ma.NewMultiaddr(address)
 			if err != nil {
-				logger.Printf("Failed to parse bootstrap address: %s", err)
+				logger.Printf("Failed to parse peer address: %s", err)
 				return
 			}
-
 			targetInfo, err := peer.AddrInfoFromP2pAddr(targetAddr)
 			if err != nil {
 				logger.Printf("Failed to create peer info: %s", err)
 				return
 			}
-
-			if err := node.PeerHost.Connect(ctx, *targetInfo); err != nil {
-				logger.Printf("Failed to connect to bootstrap node: %s", err)
+			if err := n.node.PeerHost.Connect(n.ctx, *targetInfo); err != nil {
+				logger.Printf("Failed to connect to peer: %s", err)
 			}
 		}(addr)
 	}
-
 	wg.Wait()
 	return nil
 }
 
-// Adds a file or directory to IPFS and returns its CID
 func (n *IPFSNode) AddPath(path string) (string, error) {
 	stat, err := os.Stat(path)
 	if err != nil {
@@ -173,27 +153,56 @@ func (n *IPFSNode) AddPath(path string) (string, error) {
 		return "", err
 	}
 
-	// Add the file to IPFS
 	ipfsPath, err := n.api.Unixfs().Add(n.ctx, f)
 	if err != nil {
 		return "", err
 	}
 
-	// Pin the file
 	if err := n.api.Pin().Add(n.ctx, ipfsPath); err != nil {
 		return "", err
 	}
 
-	// Extract CID from path string (format: /ipfs/<cid>)
-	pathStr := ipfsPath.String()
-	parts := strings.Split(pathStr, "/")
-	if len(parts) < 3 {
-		return "", fmt.Errorf("invalid IPFS path: %s", pathStr)
-	}
-	return parts[2], nil
+	cid := ipfsPath.Cid().String()
+	n.mu.Lock()
+	n.pinned[cid] = stat.Size()
+	n.mu.Unlock()
+
+	return cid, nil
 }
 
-// Stops the IPFS node
+func (n *IPFSNode) PinCID(cid string, size int64) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	totalSize := int64(0)
+	for _, s := range n.pinned {
+		totalSize += s
+	}
+
+	if totalSize+size > n.config.MaxPinnedSize {
+		return fmt.Errorf("pinning %s would exceed 100GB limit (current: %d bytes)", cid, totalSize)
+	}
+
+	path := iface.IpfsPath(cid)
+	if err := n.api.Pin().Add(n.ctx, path); err != nil {
+		return err
+	}
+	n.pinned[cid] = size
+	return nil
+}
+
+func (n *IPFSNode) UnpinCID(cid string) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	path := iface.IpfsPath(cid)
+	if err := n.api.Pin().Rm(n.ctx, path); err != nil {
+		return err
+	}
+	delete(n.pinned, cid)
+	return nil
+}
+
 func (n *IPFSNode) Close() error {
 	if err := n.node.Close(); err != nil {
 		return err

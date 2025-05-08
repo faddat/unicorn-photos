@@ -53,7 +53,69 @@ func DiscoverEndpoints(ctx context.Context, chainID string, seedRPCs []string, p
 	// Channel to control concurrency of IP probing
 	probeSemaphore := make(chan struct{}, maxConcurrentProbes)
 
-	// 1. Get initial peer IPs from /net_info using provided seedRPCs (these are actual RPC endpoints)
+	// Filter out unhealthy seed RPCs before using them
+	var validSeedRPCs []string
+	if len(seedRPCs) > 0 {
+		logger.Printf("[%s] Validating %d registry-provided RPC endpoints before using for discovery...", chainID, len(seedRPCs))
+		for _, rpc := range seedRPCs {
+			checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			err := checkRPC(checkCtx, rpc, chainID)
+			cancel()
+			if err == nil {
+				validSeedRPCs = append(validSeedRPCs, rpc)
+				logger.Printf("[%s] Validated seed RPC endpoint for discovery: %s", chainID, rpc)
+			} else {
+				logger.Printf("[%s] Skipping invalid seed RPC endpoint: %s (error: %v)", chainID, rpc, err)
+			}
+		}
+		logger.Printf("[%s] Found %d valid seed RPC endpoints out of %d provided", chainID, len(validSeedRPCs), len(seedRPCs))
+		seedRPCs = validSeedRPCs
+	}
+
+	// 1. Start with P2P seed nodes directly if no RPCs
+	if len(seedRPCs) == 0 {
+		logger.Printf("[%s] No seed RPCs available, starting with P2P seed nodes directly", chainID)
+		// Get IPs from P2P seed node addresses
+		logger.Printf("[%s] Discover: Extracting IPs from P2P seed nodes: %v", chainID, p2pSeedNodes)
+		peerIPsFromP2PSeeds := getIPsFromP2PAddresses(p2pSeedNodes)
+		logger.Printf("[%s] Discover: Found %d IPs from P2P seed addresses", chainID, len(peerIPsFromP2PSeeds))
+
+		// First probe these IPs directly as they might have RPC services
+		for _, ip := range peerIPsFromP2PSeeds {
+			mu.Lock()
+			if !checkedIPs[ip] {
+				checkedIPs[ip] = true
+				wg.Add(1)
+				probeSemaphore <- struct{}{} // Acquire semaphore
+				go func(pIP string) {
+					defer wg.Done()
+					probeIPForServices(ctx, mu, pIP, chainID, &discovered, "discovered_seed")
+					<-probeSemaphore // Release semaphore
+				}(ip)
+			}
+			mu.Unlock()
+		}
+
+		// Wait for first round of probing
+		wg.Wait()
+
+		// If we found some RPCs, use them to get more peers
+		var foundRPCs []string
+		mu.Lock()
+		for _, ep := range discovered {
+			if ep.Type == "rpc" {
+				foundRPCs = append(foundRPCs, ep.Address)
+			}
+		}
+		mu.Unlock()
+
+		if len(foundRPCs) > 0 {
+			logger.Printf("[%s] Found %d RPC endpoints from seed nodes, using them to discover more peers", chainID, len(foundRPCs))
+			seedRPCs = foundRPCs // Use the discovered RPCs for next step
+		}
+	}
+
+	// 2. Get peer IPs from /net_info using available RPC endpoints
 	logger.Printf("[%s] Discover: Querying seed RPCs for peers: %v", chainID, seedRPCs)
 	peerIPsFromRPC := getPeerIPsFromSeedRPCs(ctx, chainID, seedRPCs)
 	logger.Printf("[%s] Discover: Found %d peer IPs from seed RPCs", chainID, len(peerIPsFromRPC))
@@ -72,27 +134,34 @@ func DiscoverEndpoints(ctx context.Context, chainID string, seedRPCs []string, p
 		mu.Unlock()
 	}
 
-	// 2. Get initial peer IPs from P2P seed node addresses (these are P2P addresses, not necessarily RPCs)
-	logger.Printf("[%s] Discover: Extracting IPs from P2P seed nodes: %v", chainID, p2pSeedNodes)
-	peerIPsFromP2PSeeds := getIPsFromP2PAddresses(p2pSeedNodes)
-	logger.Printf("[%s] Discover: Found %d IPs from P2P seed addresses", chainID, len(peerIPsFromP2PSeeds))
-	for _, ip := range peerIPsFromP2PSeeds {
-		mu.Lock()
-		if !checkedIPs[ip] {
-			checkedIPs[ip] = true
-			wg.Add(1)
-			probeSemaphore <- struct{}{} // Acquire semaphore
-			go func(pIP string) {
-				defer wg.Done()
-				probeIPForServices(ctx, mu, pIP, chainID, &discovered, "discovered_seed")
-				<-probeSemaphore // Release semaphore
-			}(ip)
+	// 3. Get any remaining IPs from P2P seed node addresses that weren't already checked
+	if seedRPCs == nil || len(seedRPCs) == 0 {
+		// We already processed these above if we had no seed RPCs
+		wg.Wait()
+	} else {
+		// If we had seed RPCs, check P2P seeds now for any we missed
+		logger.Printf("[%s] Discover: Extracting IPs from P2P seed nodes: %v", chainID, p2pSeedNodes)
+		peerIPsFromP2PSeeds := getIPsFromP2PAddresses(p2pSeedNodes)
+		logger.Printf("[%s] Discover: Found %d IPs from P2P seed addresses", chainID, len(peerIPsFromP2PSeeds))
+		for _, ip := range peerIPsFromP2PSeeds {
+			mu.Lock()
+			if !checkedIPs[ip] {
+				checkedIPs[ip] = true
+				wg.Add(1)
+				probeSemaphore <- struct{}{} // Acquire semaphore
+				go func(pIP string) {
+					defer wg.Done()
+					probeIPForServices(ctx, mu, pIP, chainID, &discovered, "discovered_seed")
+					<-probeSemaphore // Release semaphore
+				}(ip)
+			}
+			mu.Unlock()
 		}
-		mu.Unlock()
+		wg.Wait()
 	}
 
-	wg.Wait()
-	close(probeSemaphore) // Close semaphore channel once all goroutines are done
+	// Close semaphore channel once all goroutines are done
+	close(probeSemaphore)
 
 	// Count the number of RPC and REST endpoints discovered
 	rpcCount := 0
@@ -168,13 +237,25 @@ func getPeerIPsFromSeedRPCs(ctx context.Context, chainID string, seedRPCs []stri
 	var wg sync.WaitGroup
 	mu := &sync.Mutex{}
 
+	logger.Printf("[%s] Discovery: Attempting to query /net_info from %d seed RPC endpoints", chainID, len(seedRPCs))
+	if len(seedRPCs) == 0 {
+		logger.Printf("[%s] Discovery: No seed RPC endpoints provided for /net_info queries", chainID)
+		return peerIPs
+	}
+
+	// Print out all the seed RPCs being used for discovery
+	for i, rpc := range seedRPCs {
+		logger.Printf("[%s] Discovery: Seed RPC #%d for /net_info: %s", chainID, i+1, rpc)
+	}
+
 	for _, rpcAddr := range seedRPCs {
 		wg.Add(1)
 		go func(addr string) {
 			defer wg.Done()
+			logger.Printf("[%s] Discovery: Querying /net_info from %s", chainID, addr)
 			client, err := comethttp.New(addr) // Path doesn't matter for /net_info
 			if err != nil {
-				// logger.Printf("[%s] Discovery: failed to create client for seed RPC %s: %v", chainID, addr, err)
+				logger.Printf("[%s] Discovery: Failed to create client for seed RPC %s: %v", chainID, addr, err)
 				return
 			}
 
@@ -182,9 +263,12 @@ func getPeerIPsFromSeedRPCs(ctx context.Context, chainID string, seedRPCs []stri
 			defer cancel()
 			netInfo, err := client.NetInfo(netInfoCtx)
 			if err != nil {
-				// logger.Printf("[%s] Discovery: failed to get /net_info from %s: %v", chainID, addr, err)
+				logger.Printf("[%s] Discovery: Failed to get /net_info from %s: %v", chainID, addr, err)
 				return
 			}
+
+			logger.Printf("[%s] Discovery: Successfully queried /net_info from %s, found %d peers",
+				chainID, addr, len(netInfo.Peers))
 
 			mu.Lock()
 			defer mu.Unlock()
@@ -210,13 +294,14 @@ func getPeerIPsFromSeedRPCs(ctx context.Context, chainID string, seedRPCs []stri
 					if !seenIPs[ip] && !isPrivateIP(ip) {
 						peerIPs = append(peerIPs, ip)
 						seenIPs[ip] = true
+						logger.Printf("[%s] Discovery: Added peer IP %s from /net_info", chainID, ip)
 					}
 				}
 			}
 		}(rpcAddr)
 	}
 	wg.Wait()
-	logger.Printf("[%s] Discovery: found %d unique peer IPs from seed RPCs' /net_info.", chainID, len(peerIPs))
+	logger.Printf("[%s] Discovery: Found %d unique peer IPs from seed RPCs' /net_info.", chainID, len(peerIPs))
 	return peerIPs
 }
 
@@ -232,37 +317,72 @@ func isPrivateIP(ipStr string) bool {
 func probeIPForServices(ctx context.Context, mu *sync.Mutex, ip, targetChainID string, discoveredList *[]DiscoveredEndpoint, source string) {
 	schemes := []string{"http", "https"} // Prefer http, then try https. Some nodes only expose one.
 
-	// Probe RPC
-	for _, scheme := range schemes {
-		rpcURL := fmt.Sprintf("%s://%s:%s", scheme, ip, defaultRPCPort)
-		probeCtx, cancel := context.WithTimeout(ctx, probeRPCTimeout)
-		if err := checkRPC(probeCtx, rpcURL, targetChainID); err == nil {
-			logger.Printf("[%s] Discovery: Found working RPC: %s (source: %s)", targetChainID, rpcURL, source)
-			mu.Lock()
-			*discoveredList = append(*discoveredList, DiscoveredEndpoint{Address: rpcURL, Type: "rpc", Source: source})
-			mu.Unlock()
-			// Found working RPC, no need to check other schemes for RPC on this IP
-			// We could break here, but sometimes nodes might have both http and https on different paths/setups for RPC.
-			// For simplicity, first success is taken.
-			cancel()
-			break
-		}
-		cancel()
+	// Common alternative ports for RPC - include more common Tendermint/CometBFT ports
+	rpcPorts := []string{
+		defaultRPCPort, // 26657
+		"26656",        // P2P port that sometimes has RPC too
+		"26658",        // Alternative RPC port
+		"26660",        // Sometimes used for RPC
+		"1317",         // Sometimes RPC is on REST port
 	}
 
-	// Probe REST
+	// Common alternative ports for REST - expanded list
+	restPorts := []string{
+		defaultRESTPort, // 1317
+	}
+
+	logger.Printf("[%s] Probing IP %s for RPC/REST services...", targetChainID, ip)
+
+	// Probe RPC on different ports
+	rpcFound := false
 	for _, scheme := range schemes {
-		restURL := fmt.Sprintf("%s://%s:%s", scheme, ip, defaultRESTPort)
-		probeCtx, cancel := context.WithTimeout(ctx, probeRESTTimeout)
-		if err := checkREST(probeCtx, restURL, targetChainID); err == nil {
-			logger.Printf("[%s] Discovery: Found working REST: %s (source: %s)", targetChainID, restURL, source)
-			mu.Lock()
-			*discoveredList = append(*discoveredList, DiscoveredEndpoint{Address: restURL, Type: "rest", Source: source})
-			mu.Unlock()
-			cancel()
-			break
+		if rpcFound {
+			break // If we already found an RPC on this IP with one scheme, skip the other scheme
 		}
-		cancel()
+		for _, port := range rpcPorts {
+			rpcURL := fmt.Sprintf("%s://%s:%s", scheme, ip, port)
+			probeCtx, cancel := context.WithTimeout(ctx, probeRPCTimeout)
+			if err := checkRPC(probeCtx, rpcURL, targetChainID); err == nil {
+				logger.Printf("[%s] SUCCESS: Found working RPC: %s (source: %s, port: %s)", targetChainID, rpcURL, source, port)
+				mu.Lock()
+				*discoveredList = append(*discoveredList, DiscoveredEndpoint{Address: rpcURL, Type: "rpc", Source: source})
+				mu.Unlock()
+				cancel()
+				rpcFound = true
+				// Found working RPC, no need to check other ports for this scheme
+				break
+			}
+			cancel()
+		}
+	}
+
+	// Probe REST on different ports
+	restFound := false
+	for _, scheme := range schemes {
+		if restFound {
+			break // If we already found a REST on this IP with one scheme, skip the other scheme
+		}
+		for _, port := range restPorts {
+			restURL := fmt.Sprintf("%s://%s:%s", scheme, ip, port)
+			probeCtx, cancel := context.WithTimeout(ctx, probeRESTTimeout)
+			if err := checkREST(probeCtx, restURL, targetChainID); err == nil {
+				logger.Printf("[%s] SUCCESS: Found working REST: %s (source: %s, port: %s)", targetChainID, restURL, source, port)
+				mu.Lock()
+				*discoveredList = append(*discoveredList, DiscoveredEndpoint{Address: restURL, Type: "rest", Source: source})
+				mu.Unlock()
+				cancel()
+				restFound = true
+				// Found working REST, no need to check other ports for this scheme
+				break
+			}
+			cancel()
+		}
+	}
+
+	if rpcFound || restFound {
+		logger.Printf("[%s] Successfully found services on IP %s (RPC: %v, REST: %v)", targetChainID, ip, rpcFound, restFound)
+	} else {
+		logger.Printf("[%s] No services found on IP %s", targetChainID, ip)
 	}
 }
 

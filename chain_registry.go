@@ -20,8 +20,8 @@ type BasicChainInfo struct {
 	Website      string `json:"website"`
 	Bech32Prefix string `json:"bech32_prefix"`    // From address_prefix in chain.json
 	Slip44       int    `json:"slip44,omitempty"` // from slip44 in chain.json
-	// APIs         APIs     `json:"apis"` // Can be complex, load selectively if needed
-	Peers Peers `json:"peers"`
+	APIs         APIs   `json:"apis"`             // API endpoints including RPC
+	Peers        Peers  `json:"peers"`
 	// Add other fields as needed (e.g., codebase, status, logo_URIs)
 }
 
@@ -30,18 +30,18 @@ type BasicChainInfo struct {
 // 	AddressPrefix string `json:"address_prefix"`
 // }
 
-// APIs contains endpoint lists (simplified).
-// type APIs struct {
-// 	RPC  []Endpoint `json:"rpc"`
-// 	REST []Endpoint `json:"rest"`
-// 	GRPC []Endpoint `json:"grpc"`
-// }
+// APIs contains endpoint lists.
+type APIs struct {
+	RPC  []Endpoint `json:"rpc"`
+	REST []Endpoint `json:"rest"`
+	GRPC []Endpoint `json:"grpc"`
+}
 
 // Endpoint represents a single API endpoint.
-// type Endpoint struct {
-// 	Address  string `json:"address"`
-// 	Provider string `json:"provider"`
-// }
+type Endpoint struct {
+	Address  string `json:"address"`
+	Provider string `json:"provider"`
+}
 
 // Peers contains seed and persistent peer lists.
 type Peers struct {
@@ -59,11 +59,16 @@ type PeerInfo struct {
 // --- Registry Loading Logic ---
 
 // LoadRegistryChains scans the chain registry path and returns info for matching chains.
-func LoadRegistryChains(registryPath string, networkTypeFilter string) (map[string]*BasicChainInfo, error) {
+func LoadRegistryChains(registryPath, networkTypeFilter string) (map[string]*BasicChainInfo, error) {
 	chains := make(map[string]*BasicChainInfo)
+
+	if registryPath == "" {
+		return nil, fmt.Errorf("registry path is empty")
+	}
+
 	logger.Printf("Loading chains from registry path: %s (Filter: %s)", registryPath, networkTypeFilter)
 
-	// Walk the registry directory
+	// Walk through each chain's directory in the registry
 	err := filepath.WalkDir(registryPath, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			// Skip directories that can't be read, log warning
@@ -84,8 +89,6 @@ func LoadRegistryChains(registryPath string, networkTypeFilter string) (map[stri
 				return nil // Skip chain.json at the very root
 			}
 
-			registryName := filepath.Base(parentDir) // Use the folder name as the key
-
 			// Read and parse chain.json
 			data, readErr := os.ReadFile(path)
 			if readErr != nil {
@@ -99,7 +102,9 @@ func LoadRegistryChains(registryPath string, networkTypeFilter string) (map[stri
 				return nil // Continue walking
 			}
 
-			// Apply filter
+			// Get registry directory name (used as key and for registry_name)
+			registryName := filepath.Base(parentDir) // Use the folder name as the key
+
 			if networkTypeFilter == "" || strings.EqualFold(chainInfo.NetworkType, networkTypeFilter) {
 				// Basic validation
 				if chainInfo.ChainID == "" || chainInfo.ChainName == "" {
@@ -121,11 +126,6 @@ func LoadRegistryChains(registryPath string, networkTypeFilter string) (map[stri
 						chainInfo.Bech32Prefix = prefix
 					}
 				}
-
-				// TODO: Optionally parse API endpoints if needed as hints
-				// var apiData struct { Apis APIs `json:"apis"` }
-				// json.Unmarshal(data, &apiData)
-				// chainInfo.APIs = apiData.Apis
 
 				chains[registryName] = &chainInfo
 				// logger.Printf("Loaded chain: %s (ID: %s)", chainInfo.PrettyName, chainInfo.ChainID)
@@ -151,6 +151,28 @@ func getP2PAddresses(peers []PeerInfo) []string {
 			addrs = append(addrs, fmt.Sprintf("%s@%s", p.ID, p.Address))
 		} else if p.Address != "" {
 			addrs = append(addrs, p.Address)
+		}
+	}
+	return addrs
+}
+
+// Helper to get RPC addresses from Endpoint slice
+func getRPCAddresses(endpoints []Endpoint) []string {
+	addrs := make([]string, 0, len(endpoints))
+	for _, e := range endpoints {
+		if e.Address != "" {
+			addrs = append(addrs, e.Address)
+		}
+	}
+	return addrs
+}
+
+// Helper to get REST addresses from Endpoint slice
+func getRESTAddresses(endpoints []Endpoint) []string {
+	addrs := make([]string, 0, len(endpoints))
+	for _, e := range endpoints {
+		if e.Address != "" {
+			addrs = append(addrs, e.Address)
 		}
 	}
 	return addrs

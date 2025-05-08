@@ -35,6 +35,7 @@ type ChainRuntimeConfig struct {
 	RPCEndpoints                 []string      // Endpoints to try first (from override or registry)
 	RESTEndpoints                []string      // Endpoints to try first (from override or registry)
 	SeedNodesP2P                 []string      // Seeds for discovery (from override or registry)
+	SeedRPCsForDiscovery         []string      // RPC endpoints from registry used only for peer discovery
 	EnablePeerDiscoveryFallback  bool          // Final discovery setting
 	SnapshotInterval             time.Duration // Final interval
 	SnapshotIntervalRaw          string        // Raw interval string

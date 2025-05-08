@@ -352,9 +352,10 @@ func runDaemon(ctx context.Context, chainNames []string) error {
 							if runtimeConf.ChainID == "" {
 								runtimeConf.ChainID = basicInfo.ChainID
 							}
-							if len(runtimeConf.SeedNodesP2P) == 0 && len(runtimeConf.RPCEndpoints) == 0 { // Only fill if both are empty
+							if len(runtimeConf.SeedNodesP2P) == 0 { // Only get P2P seeds from registry
 								runtimeConf.SeedNodesP2P = getP2PAddresses(basicInfo.Peers.Seeds)
-								// Optionally add REST from registry if runtimeConf.RESTEndpoints is empty too
+								// Extract RPC endpoints for peer discovery only
+								runtimeConf.SeedRPCsForDiscovery = getRPCAddresses(basicInfo.APIs.RPC)
 							}
 							if runtimeConf.Name == "" || runtimeConf.Name == name {
 								runtimeConf.Name = basicInfo.PrettyName
@@ -504,8 +505,12 @@ func createRuntimeConfig(basicInfo *BasicChainInfo, globalConfig *Config, overri
 		EnablePeerDiscoveryFallback: true, // Default to true
 		// Data from registry
 		SeedNodesP2P: getP2PAddresses(basicInfo.Peers.Seeds),
-		// Consider adding REST/RPC from registry if available as a base
-		// For now, rely on discovery or overrides for these.
+		// Extract RPC endpoints from registry but only use them for peer discovery via /net_info
+		// This ensures we rely on dynamically discovered endpoints for operations
+		SeedRPCsForDiscovery: getRPCAddresses(basicInfo.APIs.RPC),
+		// Empty configs for actual operations - will be filled by discovery
+		RPCEndpoints:  []string{},
+		RESTEndpoints: []string{},
 	}
 
 	if len(basicInfo.Peers.PersistentPeers) > 0 {
@@ -550,10 +555,6 @@ func createRuntimeConfig(basicInfo *BasicChainInfo, globalConfig *Config, overri
 		}
 	}
 
-	// If peer discovery is enabled but no seeds/RPCs, it won't work well.
-	// This is more of a runtime check in getHealthyEndpoint.
-	// EnablePeerDiscoveryFallback is a hint.
-
 	return rt
 }
 
@@ -586,6 +587,7 @@ func createRuntimeConfigFromOverrideOnly(override *ChainOverrideConfig, globalCo
 		SeedNodesP2P:                override.SeedNodesP2P,
 		RPCEndpoints:                override.RPCEndpoints,
 		RESTEndpoints:               override.RESTEndpoints,
+		SeedRPCsForDiscovery:        override.RPCEndpoints, // Use RPCEndpoints from override as seed RPCs for discovery
 	}
 
 	if override.Enabled != nil {
@@ -999,8 +1001,8 @@ func getHealthyEndpointRuntime(ctx context.Context, chainConfig *ChainRuntimeCon
 	// Use a new context for discovery to not be bound by the original short check timeout
 	discoveryPhaseCtx, discoveryCancel := context.WithTimeout(context.Background(), 2*time.Minute) // Generous timeout for full discovery
 	defer discoveryCancel()
-	// SeedRPCs for discovery can be from config or previously discovered ones. For now, use config.
-	discovered, discErr := DiscoverEndpoints(discoveryPhaseCtx, chainConfig.ChainID, chainConfig.RPCEndpoints, chainConfig.SeedNodesP2P)
+	// Use SeedRPCsForDiscovery instead of RPCEndpoints for peer discovery
+	discovered, discErr := DiscoverEndpoints(discoveryPhaseCtx, chainConfig.ChainID, chainConfig.SeedRPCsForDiscovery, chainConfig.SeedNodesP2P)
 
 	state.mu.Lock()         // Re-lock to update state.RPCEndpoints/state.RESTEndpoints
 	defer state.mu.Unlock() // Ensure it's unlocked on all paths from here

@@ -7,7 +7,7 @@ log_level = "info" # e.g., debug, info, warn, error
 # --- Chain Source & Filtering ---
 # Path to the local clone of the cosmos/chain-registry repository
 # Required if all_chains = true OR if chains_to_snapshot is used
-chain_registry_path = "/path/to/your/chain-registry" # REQUIRED - Set this path
+chain_registry_path = "~/cosmos-chain-registry" # REQUIRED - Set this path
 
 # Set to true to attempt snapshotting ALL 'mainnet' chains found in the registry.
 # If true, 'chains_to_snapshot' is ignored. Overrides in [[chains]] still apply.

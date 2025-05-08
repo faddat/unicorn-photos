@@ -500,7 +500,7 @@ func fetchAllModuleStates(restURL, chainIDStr string, currentBlockHeight int64) 
 		for entry := range balanceChan {
 			bankBalances = append(bankBalances, entry)
 		}
-		for _ = range balanceErrChan { // Corrected: Use blank identifier for unused err
+		for range balanceErrChan { // Corrected: Removed "_ ="
 			// Log aggregated errors or a sample?
 			// logger.Printf("[%s] Warning: balance fetch error: %v", chainIDStr, err)
 			balanceFetchErrors++

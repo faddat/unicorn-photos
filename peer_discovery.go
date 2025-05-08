@@ -31,8 +31,8 @@ var (
 	// Regex to extract IP from P2P address like tcp://1.2.3.4:26656 or id@1.2.3.4:26656
 	// It tries to capture IPv4 addresses.
 	ipFromP2PRegex = regexp.MustCompile(`(?:tcp://)?([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+):[0-9]+`)
-	// For URLs like "http://somehost:port" or "somehost:port"
-	hostFromURLRegex = regexp.MustCompile(`^(?:(?:https?|tcp)://)?([^:/]+)`)
+	// For URLs like "http://somehost:port" or "somehost:port" - Removed unused regex
+	// hostFromURLRegex = regexp.MustCompile(`^(?:(?:https?|tcp)://)?([^:/]+)`)
 )
 
 type DiscoveredEndpoint struct {
@@ -141,8 +141,6 @@ func getIPsFromP2PAddresses(p2pAddresses []string) []string {
 						}
 					}
 				}
-			} else {
-				// logger.Printf("Warning: Could not resolve P2P host '%s' to IP: %v", host, err)
 			}
 		}
 	}
@@ -270,11 +268,6 @@ func checkRPC(ctx context.Context, rpcURL, targetChainID string) error {
 	if status.NodeInfo.Network != targetChainID {
 		return fmt.Errorf("chain ID mismatch at %s: expected %s, got %s", rpcURL, targetChainID, status.NodeInfo.Network)
 	}
-	if status.SyncInfo.CatchingUp {
-		// Depending on strictness, a catching_up node might be okay or not.
-		// For snapshots, we generally want a fully synced node.
-		// return fmt.Errorf("node %s is catching up (latest height: %d, block time: %s)", rpcURL, status.SyncInfo.LatestBlockHeight, status.SyncInfo.LatestBlockTime)
-	}
 	return nil
 }
 
@@ -296,7 +289,11 @@ func checkREST(ctx context.Context, restURL, targetChainID string) error {
 	if err != nil {
 		return fmt.Errorf("GET %s failed: %w", nodeInfoURL, err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			logger.Printf("Error closing response body for %s: %v", nodeInfoURL, err)
+		}
+	}()
 
 	if resp.StatusCode != standardhttp.StatusOK {
 		return fmt.Errorf("%s returned status %d", nodeInfoURL, resp.StatusCode)

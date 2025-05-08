@@ -29,7 +29,11 @@ func HTTPGet(url string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute GET request to %s: %w", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			logger.Printf("Error closing response body for %s: %v", url, err)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body) // Read body for error context

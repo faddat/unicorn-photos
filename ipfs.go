@@ -73,17 +73,23 @@ func NewIPFSNode(ctx context.Context, appConfig *Config) (*IPFSNode, error) {
 	plugins, err := loader.NewPluginLoader("")
 	if err != nil {
 		cancel()
-		repo.Close()
+		if errClose := repo.Close(); errClose != nil {
+			logger.Printf("IPFS: Error closing repo after plugin load failure: %v", errClose)
+		}
 		return nil, fmt.Errorf("error loading IPFS plugins: %w", err)
 	}
 	if err := plugins.Initialize(); err != nil {
 		cancel()
-		repo.Close()
+		if errClose := repo.Close(); errClose != nil {
+			logger.Printf("IPFS: Error closing repo after plugin init failure: %v", errClose)
+		}
 		return nil, fmt.Errorf("error initializing IPFS plugins: %w", err)
 	}
 	if err := plugins.Inject(); err != nil {
 		cancel()
-		repo.Close()
+		if errClose := repo.Close(); errClose != nil {
+			logger.Printf("IPFS: Error closing repo after plugin inject failure: %v", errClose)
+		}
 		return nil, fmt.Errorf("error injecting IPFS plugins: %w", err)
 	}
 
@@ -105,9 +111,13 @@ func NewIPFSNode(ctx context.Context, appConfig *Config) (*IPFSNode, error) {
 
 	api, err := coreapi.NewCoreAPI(n)
 	if err != nil {
-		n.Close()
+		if errNodeClose := n.Close(); errNodeClose != nil {
+			logger.Printf("IPFS: Error closing node after CoreAPI failure: %v", errNodeClose)
+		}
 		cancel()
-		repo.Close()
+		if errClose := repo.Close(); errClose != nil {
+			logger.Printf("IPFS: Error closing repo after CoreAPI failure: %v", errClose)
+		}
 		return nil, fmt.Errorf("failed to get IPFS CoreAPI: %w", err)
 	}
 
@@ -258,11 +268,6 @@ func (n *IPFSNode) PinCID(cidStr string, size int64) error {
 	}
 
 	_, pinnedStatus, err := n.api.Pin().IsPinned(n.ctx, parsedPath) // Corrected assignment
-	if err != nil {
-		// If it's "not found" or "not pinned", that's okay, we'll try to pin.
-		// Specific error handling might be needed if IsPinned itself fails for other reasons.
-		// logger.Printf("IPFS: Pre-pin check for %s: IsPinned returned error: %v", cidStr, err)
-	}
 
 	if !pinnedStatus { // If not pinned (or IsPinned had an error that implies not pinned)
 		if err := n.api.Pin().Add(n.ctx, parsedPath); err != nil {

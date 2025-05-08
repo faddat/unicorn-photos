@@ -100,7 +100,7 @@ func LoadRegistryChains(registryPath string, networkTypeFilter string) (map[stri
 			}
 
 			// Apply filter
-			if networkTypeFilter == "" || strings.ToLower(chainInfo.NetworkType) == strings.ToLower(networkTypeFilter) {
+			if networkTypeFilter == "" || strings.EqualFold(chainInfo.NetworkType, networkTypeFilter) {
 				// Basic validation
 				if chainInfo.ChainID == "" || chainInfo.ChainName == "" {
 					logger.Printf("Warning: Skipping %s, missing chain_id or chain_name.", path)

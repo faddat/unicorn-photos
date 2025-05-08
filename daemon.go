@@ -53,7 +53,11 @@ func runDaemon(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to initialize IPFS node: %v", err)
 	}
-	defer ipfs.Close()
+	defer func() {
+		if err := ipfs.Close(); err != nil {
+			logger.Printf("Error closing IPFS node: %v", err)
+		}
+	}()
 	logger.Printf("IPFS node initialized")
 
 	// --- Determine Chains to Process ---
@@ -76,11 +80,9 @@ func runDaemon(ctx context.Context) error {
 
 	if config.AllChains {
 		logger.Printf("Processing all mainnet chains from registry...")
-		if registryChains != nil {
-			for name, basicInfo := range registryChains {
-				runtimeConf := createRuntimeConfig(basicInfo, config, configOverrides[name])
-				chainsToProcess[name] = runtimeConf
-			}
+		for name, basicInfo := range registryChains {
+			runtimeConf := createRuntimeConfig(basicInfo, config, configOverrides[name])
+			chainsToProcess[name] = runtimeConf
 		}
 		// Also add any explicit [[chains]] that weren't overrides (e.g., testnets defined only in config)
 		for name, override := range configOverrides {
@@ -694,12 +696,12 @@ func pruneOldSnapshotsForChain(ipfs *IPFSNode, config *Config, chainConfig *Chai
 
 // getDirSize remains the same
 
-// manageMutualPinning remains disabled
-func manageMutualPinning(ctx context.Context, node *IPFSNode, config *Config) {
-	logger.Printf("Mutual pinning service is currently disabled.")
-	<-ctx.Done()
-	logger.Printf("Mutual pinning service stopped.")
-}
+// manageMutualPinning remains disabled - Removed function definition
+// func manageMutualPinning(ctx context.Context, node *IPFSNode, config *Config) {
+// 	logger.Printf("Mutual pinning service is currently disabled.")
+// 	<-ctx.Done()
+// 	logger.Printf("Mutual pinning service stopped.")
+// }
 
 // Need matching takeSnapshotRuntime function (can be in snapshot_core.go)
 // Need getLatestBlockHeight definition that matches call

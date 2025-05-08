@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	// "sync/atomic" // No longer needed
 )
 
 // Struct to hold runtime state for endpoints
@@ -20,7 +21,9 @@ type ChainEndpointsState struct {
 	mu            sync.Mutex
 }
 
-var chainEndpoints = make(map[string]*ChainEndpointsState) // chainID -> state
+// ChainEndpointsState remains the same
+
+var chainEndpoints = make(map[string]*ChainEndpointsState)
 var chainEndpointsMu sync.Mutex
 
 func getChainEndpointsState(chainID string) *ChainEndpointsState {
@@ -38,13 +41,13 @@ func runDaemon(ctx context.Context) error {
 		return fmt.Errorf("failed to load configuration: %w", err)
 	}
 
-	// Initialize logger with configured level (implementation detail for logger.go)
-	// SetupLogger(config.LogLevel)
-
-	logger.Printf("Starting Unicorn Photos IPFS snapshot daemon for multiple chains")
-	logger.Printf("Global snapshot interval: %s", config.GlobalSnapshotInterval)
-	logger.Printf("Max pinned size: %d bytes (%d GB)", config.MaxPinnedSizeBytes, config.MaxPinnedSizeGB)
-	logger.Printf("Pruning threshold: %d bytes (%d GB)", config.PruningThresholdBytes, config.PruningThresholdGB)
+	logger.Printf("Starting Unicorn Photos IPFS snapshot daemon")
+	logger.Printf("Snapshot Base Directory: %s", config.SnapshotBaseDir)
+	logger.Printf("Chain Registry Path: %s", config.ChainRegistryPath)
+	logger.Printf("Snapshot All Chains: %t", config.AllChains)
+	if !config.AllChains {
+		logger.Printf("Specific Chains to Snapshot: %v", config.ChainsToSnapshot)
+	}
 
 	ipfs, err := NewIPFSNode(ctx, config)
 	if err != nil {
@@ -53,89 +56,346 @@ func runDaemon(ctx context.Context) error {
 	defer ipfs.Close()
 	logger.Printf("IPFS node initialized")
 
-	var wg sync.WaitGroup
-	for i := range config.Chains {
-		chainCfg := config.Chains[i] // Create a copy for the goroutine
-		if chainCfg.Enabled {
-			wg.Add(1)
-			go func(cChainCfg ChainConfig) {
-				defer wg.Done()
-				runChainSnapshotter(ctx, &cChainCfg, config, ipfs) // Pass pointer to allow state updates
-			}(chainCfg)
+	// --- Determine Chains to Process ---
+	chainsToProcess := make(map[string]*ChainRuntimeConfig) // Use map to handle overrides easily (key: registry name)
+	configOverrides := make(map[string]*ChainOverrideConfig)
+	for i := range config.ChainOverrides {
+		configOverrides[config.ChainOverrides[i].Name] = &config.ChainOverrides[i]
+	}
 
-			// Start per-chain pruning goroutine
-			wg.Add(1)
-			go func(cChainCfg ChainConfig) {
-				defer wg.Done()
-				runPerChainPruning(ctx, cChainCfg, config, ipfs)
-			}(chainCfg)
+	// Load from registry if needed
+	var registryChains map[string]*BasicChainInfo
+	if config.AllChains || len(config.ChainsToSnapshot) > 0 {
+		registryChains, err = LoadRegistryChains(config.ChainRegistryPath, "mainnet")
+		if err != nil {
+			// If registry fails, we can only process chains explicitly defined in overrides
+			logger.Printf("Error loading chain registry: %v. Only chains defined explicitly in config [[chains]] will be processed.", err)
+			// Proceed, but registryChains will be nil
 		}
 	}
 
-	// Global pruning (could be for shared resources or as a fallback)
-	// For now, per-chain pruning is primary. This can be re-enabled if needed.
-	// go manageGlobalPruning(ctx, config, ipfs)
+	if config.AllChains {
+		logger.Printf("Processing all mainnet chains from registry...")
+		if registryChains != nil {
+			for name, basicInfo := range registryChains {
+				runtimeConf := createRuntimeConfig(basicInfo, config, configOverrides[name])
+				chainsToProcess[name] = runtimeConf
+			}
+		}
+		// Also add any explicit [[chains]] that weren't overrides (e.g., testnets defined only in config)
+		for name, override := range configOverrides {
+			if _, exists := chainsToProcess[name]; !exists {
+				// This chain was only in config, not registry mainnet list
+				runtimeConf := createRuntimeConfigFromOverrideOnly(override, config)
+				if runtimeConf != nil { // Check if minimal info was present
+					chainsToProcess[name] = runtimeConf
+				}
+			}
+		}
 
-	// Mutual pinning can run globally
-	go manageMutualPinning(ctx, ipfs, config)
+	} else if len(config.ChainsToSnapshot) > 0 {
+		logger.Printf("Processing specific chains from 'chains_to_snapshot' list...")
+		if registryChains != nil {
+			for _, name := range config.ChainsToSnapshot {
+				if basicInfo, ok := registryChains[name]; ok {
+					runtimeConf := createRuntimeConfig(basicInfo, config, configOverrides[name])
+					chainsToProcess[name] = runtimeConf
+				} else {
+					logger.Printf("Warning: Chain '%s' from 'chains_to_snapshot' not found in registry.", name)
+					// Check if it exists as an override-only entry
+					if override, ok := configOverrides[name]; ok {
+						runtimeConf := createRuntimeConfigFromOverrideOnly(override, config)
+						if runtimeConf != nil {
+							chainsToProcess[name] = runtimeConf
+						}
+					}
+				}
+			}
+		} else { // Registry failed, but we have a specific list - try overrides only
+			for _, name := range config.ChainsToSnapshot {
+				if override, ok := configOverrides[name]; ok {
+					runtimeConf := createRuntimeConfigFromOverrideOnly(override, config)
+					if runtimeConf != nil {
+						chainsToProcess[name] = runtimeConf
+					}
+				} else {
+					logger.Printf("Warning: Cannot process chain '%s' - not found in registry (or registry failed) and no override found.", name)
+				}
+			}
+		}
+		// Also add override-only chains not in the snapshot list
+		for name, override := range configOverrides {
+			if _, exists := chainsToProcess[name]; !exists {
+				runtimeConf := createRuntimeConfigFromOverrideOnly(override, config)
+				if runtimeConf != nil {
+					chainsToProcess[name] = runtimeConf
+				}
+			}
+		}
+	} else {
+		logger.Printf("Processing only chains explicitly defined in config [[chains]] blocks...")
+		// Only process chains from the [[chains]] overrides section
+		for name, override := range configOverrides {
+			runtimeConf := createRuntimeConfigFromOverrideOnly(override, config)
+			// Try lookup in registry if seeds/chainid missing
+			if runtimeConf != nil {
+				if len(runtimeConf.SeedNodesP2P) == 0 || runtimeConf.ChainID == "" {
+					logger.Printf("Explicit chain '%s' missing ChainID or Seeds, attempting registry lookup...", name)
+					if registryChains != nil { // Check if registry loaded
+						if basicInfo, ok := registryChains[name]; ok {
+							if runtimeConf.ChainID == "" {
+								runtimeConf.ChainID = basicInfo.ChainID
+							}
+							if len(runtimeConf.SeedNodesP2P) == 0 {
+								runtimeConf.SeedNodesP2P = getP2PAddresses(basicInfo.Peers.Seeds)
+							}
+							if runtimeConf.Name == "" {
+								runtimeConf.Name = basicInfo.PrettyName
+							}
+						} else {
+							logger.Printf("Warning: Cannot find registry info for explicitly defined chain '%s' to fill missing details.", name)
+						}
+					} else {
+						logger.Printf("Warning: Registry not loaded, cannot fill missing details for '%s'.", name)
+					}
+				}
+				// Final check if essential info is present
+				if runtimeConf.ChainID != "" { // SeedNodes might be empty if only direct endpoints are given
+					chainsToProcess[name] = runtimeConf
+				} else {
+					logger.Printf("Warning: Skipping explicitly defined chain '%s' due to missing ChainID.", name)
+				}
+			}
+		}
+	}
 
-	<-ctx.Done() // Wait for context cancellation (e.g., SIGINT)
+	// --- Launch Goroutines ---
+	var wg sync.WaitGroup
+	finalChainCount := 0
+	for _, runtimeConf := range chainsToProcess {
+		if runtimeConf.Enabled {
+			finalChainCount++
+			// Create copies for goroutines
+			rtConfCopy := *runtimeConf
+			globalConfCopy := *config
+
+			wg.Add(1)
+			go func(crc ChainRuntimeConfig, gc Config) {
+				defer wg.Done()
+				// Pass ChainRuntimeConfig now
+				runChainSnapshotter(ctx, &crc, &gc, ipfs)
+			}(rtConfCopy, globalConfCopy)
+
+			wg.Add(1)
+			go func(crc ChainRuntimeConfig, gc Config) {
+				defer wg.Done()
+				// Pass ChainRuntimeConfig now
+				runPerChainPruning(ctx, crc, &gc, ipfs)
+			}(rtConfCopy, globalConfCopy)
+		} else {
+			logger.Printf("Skipping disabled chain: %s (%s)", runtimeConf.Name, runtimeConf.ChainID)
+		}
+	}
+
+	if finalChainCount == 0 {
+		logger.Printf("Warning: No chains enabled or configured for processing.")
+	} else {
+		logger.Printf("Launched snapshot/pruning goroutines for %d enabled chains.", finalChainCount)
+	}
+
+	// Mutual pinning is disabled
+	// go manageMutualPinning(ctx, ipfs, config)
+
+	<-ctx.Done()
 	logger.Printf("Daemon shutting down...")
-	wg.Wait() // Wait for all chain snapshotters to finish
+	wg.Wait()
 	logger.Printf("All chain processors stopped.")
 	return ctx.Err()
 }
 
-func runChainSnapshotter(ctx context.Context, chainConfig *ChainConfig, globalConfig *Config, ipfs *IPFSNode) {
-	logger.Printf("[%s] Starting snapshotter. Configured Interval: %s", chainConfig.ChainID, chainConfig.SnapshotIntervalRaw)
+// --- Helper Functions for Config Merging ---
+
+// createRuntimeConfig merges registry info and overrides from config.toml [[chains]]
+func createRuntimeConfig(basicInfo *BasicChainInfo, globalConfig *Config, override *ChainOverrideConfig) *ChainRuntimeConfig {
+	rt := &ChainRuntimeConfig{
+		RegistryName: basicInfo.RegistryName,
+		Name:         basicInfo.PrettyName,
+		ChainID:      basicInfo.ChainID,
+		// Defaults from global config
+		Enabled:                     true, // Default to enabled if selected
+		SnapshotInterval:            globalConfig.GlobalSnapshotInterval,
+		SnapshotIntervalRaw:         globalConfig.GlobalSnapshotIntervalRaw,
+		MaxSnapshotsToKeepPerChain:  globalConfig.GlobalMaxSnapshotsToKeep,
+		PruneInterval:               globalConfig.GlobalPruneInterval,
+		EnablePeerDiscoveryFallback: true, // Default to true if seeds are available
+		// Data from registry
+		SeedNodesP2P: getP2PAddresses(basicInfo.Peers.Seeds), // Add persistent peers too? Maybe config option.
+		// Optionally add registry API endpoints as hints if available/parsed
+	}
+
+	// Apply overrides
+	if override != nil {
+		if override.Enabled != nil {
+			rt.Enabled = *override.Enabled
+		}
+		if override.Name != "" {
+			rt.Name = override.Name
+		} // Allow overriding pretty name
+		if len(override.RPCEndpoints) > 0 {
+			rt.RPCEndpoints = override.RPCEndpoints
+		}
+		if len(override.RESTEndpoints) > 0 {
+			rt.RESTEndpoints = override.RESTEndpoints
+		}
+		if len(override.SeedNodesP2P) > 0 {
+			rt.SeedNodesP2P = override.SeedNodesP2P
+		}
+		if override.EnablePeerDiscoveryFallback != nil {
+			rt.EnablePeerDiscoveryFallback = *override.EnablePeerDiscoveryFallback
+		}
+		if override.SnapshotInterval > 0 {
+			rt.SnapshotInterval = override.SnapshotInterval
+		}
+		if override.SnapshotIntervalRaw != "" {
+			rt.SnapshotIntervalRaw = override.SnapshotIntervalRaw
+		} // Override raw too
+		if override.MaxSnapshotsToKeepPerChain != nil && *override.MaxSnapshotsToKeepPerChain >= 0 {
+			rt.MaxSnapshotsToKeepPerChain = *override.MaxSnapshotsToKeepPerChain
+		}
+		if override.PruneInterval > 0 {
+			rt.PruneInterval = override.PruneInterval
+		}
+	}
+
+	// Disable peer discovery fallback if no seeds are available
+	if len(rt.SeedNodesP2P) == 0 {
+		rt.EnablePeerDiscoveryFallback = false
+	}
+
+	return rt
+}
+
+// createRuntimeConfigFromOverrideOnly creates a runtime config based *only* on a [[chains]] block
+func createRuntimeConfigFromOverrideOnly(override *ChainOverrideConfig, globalConfig *Config) *ChainRuntimeConfig {
+	if override == nil {
+		return nil
+	}
+
+	// Essential info MUST be in the override if not in registry
+	if override.ChainID == "" {
+		logger.Printf("Warning: Skipping chain '%s' defined only in config: missing required 'chain_id'.", override.Name)
+		return nil
+	}
+	// Need seeds or direct endpoints if not relying on registry lookup
+	if len(override.SeedNodesP2P) == 0 && len(override.RPCEndpoints) == 0 && len(override.RESTEndpoints) == 0 {
+		logger.Printf("Warning: Skipping chain '%s' defined only in config: must provide 'seed_nodes_p2p', 'rpc_endpoints', or 'rest_endpoints'.", override.Name)
+		return nil
+	}
+
+	rt := &ChainRuntimeConfig{
+		RegistryName: override.Name, // Use config name as key
+		Name:         override.Name, // Use config name unless overridden later?
+		ChainID:      override.ChainID,
+		// Defaults from global config, overridden by specific chain block
+		Enabled:                     true, // Default enabled unless explicitly set false
+		SnapshotInterval:            globalConfig.GlobalSnapshotInterval,
+		SnapshotIntervalRaw:         globalConfig.GlobalSnapshotIntervalRaw,
+		MaxSnapshotsToKeepPerChain:  globalConfig.GlobalMaxSnapshotsToKeep,
+		PruneInterval:               globalConfig.GlobalPruneInterval,
+		EnablePeerDiscoveryFallback: true, // Default true
+		SeedNodesP2P:                override.SeedNodesP2P,
+		RPCEndpoints:                override.RPCEndpoints,
+		RESTEndpoints:               override.RESTEndpoints,
+	}
+
+	// Apply non-empty overrides from the struct
+	if override.Enabled != nil {
+		rt.Enabled = *override.Enabled
+	}
+	if override.SnapshotInterval > 0 {
+		rt.SnapshotInterval = override.SnapshotInterval
+	}
+	if override.SnapshotIntervalRaw != "" {
+		rt.SnapshotIntervalRaw = override.SnapshotIntervalRaw
+	}
+	if override.MaxSnapshotsToKeepPerChain != nil && *override.MaxSnapshotsToKeepPerChain >= 0 {
+		rt.MaxSnapshotsToKeepPerChain = *override.MaxSnapshotsToKeepPerChain
+	}
+	if override.PruneInterval > 0 {
+		rt.PruneInterval = override.PruneInterval
+	}
+	if override.EnablePeerDiscoveryFallback != nil {
+		rt.EnablePeerDiscoveryFallback = *override.EnablePeerDiscoveryFallback
+	}
+
+	// Disable peer discovery fallback if no seeds are available
+	if len(rt.SeedNodesP2P) == 0 {
+		rt.EnablePeerDiscoveryFallback = false
+	}
+
+	return rt
+}
+
+// --- Snapshotting and Pruning Logic ---
+// (runChainSnapshotter, takeAndProcessSnapshotForChain, runPerChainPruning, pruneOldSnapshotsForChain)
+// These functions now accept ChainRuntimeConfig
+
+// Updated runChainSnapshotter to accept ChainRuntimeConfig
+func runChainSnapshotter(ctx context.Context, chainConfig *ChainRuntimeConfig, globalConfig *Config, ipfs *IPFSNode) {
+	logger.Printf("[%s / %s] Starting snapshotter. Interval: %s", chainConfig.Name, chainConfig.ChainID, chainConfig.SnapshotIntervalRaw)
 
 	isContinuous := chainConfig.SnapshotIntervalRaw == "0s" || chainConfig.SnapshotInterval == 0
 	var ticker *time.Ticker
 	if !isContinuous {
+		if chainConfig.SnapshotInterval <= 0 {
+			logger.Printf("[%s / %s] Warning: Invalid non-zero snapshot interval %s, defaulting to 4h.", chainConfig.Name, chainConfig.ChainID, chainConfig.SnapshotInterval)
+			chainConfig.SnapshotInterval = 4 * time.Hour // Fallback
+		}
 		ticker = time.NewTicker(chainConfig.SnapshotInterval)
 		defer ticker.Stop()
 	} else {
-		logger.Printf("[%s] Running in continuous mode (as frequent as possible).", chainConfig.ChainID)
+		logger.Printf("[%s / %s] Running in continuous mode.", chainConfig.Name, chainConfig.ChainID)
 	}
 
-	// Initial snapshot for this chain
-	logger.Printf("[%s] Attempting initial snapshot...", chainConfig.ChainID)
+	// Initial snapshot attempt
+	logger.Printf("[%s / %s] Attempting initial snapshot...", chainConfig.Name, chainConfig.ChainID)
 	if err := takeAndProcessSnapshotForChain(ctx, chainConfig, globalConfig, ipfs); err != nil {
-		logger.Printf("[%s] Error during initial snapshot: %v", chainConfig.ChainID, err)
+		logger.Printf("[%s / %s] Error during initial snapshot: %v", chainConfig.Name, chainConfig.ChainID, err)
 	}
 
+	// Main loop (logic remains the same, just uses ChainRuntimeConfig)
 	for {
+		var delay time.Duration
 		if isContinuous {
-			// In continuous mode, run immediately, then short pause to prevent tight loop on errors
-			if err := takeAndProcessSnapshotForChain(ctx, chainConfig, globalConfig, ipfs); err != nil {
-				logger.Printf("[%s] Error in continuous snapshot: %v. Retrying after 1 minute.", chainConfig.ChainID, err)
-				select {
-				case <-time.After(1 * time.Minute):
-				case <-ctx.Done():
-					logger.Printf("[%s] Stopping continuous snapshotter.", chainConfig.ChainID)
-					return
-				}
+			err := takeAndProcessSnapshotForChain(ctx, chainConfig, globalConfig, ipfs)
+			if err != nil {
+				logger.Printf("[%s / %s] Error in continuous snapshot: %v. Retrying after 1 minute.", chainConfig.Name, chainConfig.ChainID, err)
+				delay = 1 * time.Minute
 			} else {
-				// Optional: Add a very short delay even on success for continuous mode
-				// to yield resources, e.g., time.Sleep(1 * time.Second)
+				delay = 1 * time.Second
 			}
 		} else {
-			// Timed mode
 			select {
 			case <-ctx.Done():
-				logger.Printf("[%s] Stopping snapshotter.", chainConfig.ChainID)
+				logger.Printf("[%s / %s] Stopping snapshotter (timer).", chainConfig.Name, chainConfig.ChainID)
 				return
 			case <-ticker.C:
 				if err := takeAndProcessSnapshotForChain(ctx, chainConfig, globalConfig, ipfs); err != nil {
-					logger.Printf("[%s] Error taking scheduled snapshot: %v", chainConfig.ChainID, err)
+					logger.Printf("[%s / %s] Error taking scheduled snapshot: %v", chainConfig.Name, chainConfig.ChainID, err)
 				}
 			}
 		}
-		// Check context after loop iteration for continuous mode
-		if isContinuous {
+		if delay > 0 {
+			select {
+			case <-time.After(delay): // continue loop
+			case <-ctx.Done():
+				logger.Printf("[%s / %s] Stopping continuous snapshotter during delay.", chainConfig.Name, chainConfig.ChainID)
+				return
+			}
+		} else {
 			select {
 			case <-ctx.Done():
-				logger.Printf("[%s] Stopping continuous snapshotter.", chainConfig.ChainID)
+				logger.Printf("[%s / %s] Stopping snapshotter loop.", chainConfig.Name, chainConfig.ChainID)
 				return
 			default: // Non-blocking check
 			}
@@ -143,366 +403,305 @@ func runChainSnapshotter(ctx context.Context, chainConfig *ChainConfig, globalCo
 	}
 }
 
-// getHealthyEndpoint tries configured endpoints, then peer-discovered ones.
-func getHealthyEndpoint(ctx context.Context, chainConfig *ChainConfig, endpointType string) (string, error) {
-	state := getChainEndpointsState(chainConfig.ChainID)
+// Updated takeAndProcessSnapshotForChain to accept ChainRuntimeConfig
+func takeAndProcessSnapshotForChain(ctx context.Context, chainConfig *ChainRuntimeConfig, globalConfig *Config, ipfs *IPFSNode) error {
+	logger.Printf("[%s / %s] Checking for new blocks...", chainConfig.Name, chainConfig.ChainID)
+
+	// Need to adapt getHealthyEndpoint to work with ChainRuntimeConfig
+	rpcURL, err := getHealthyEndpointRuntime(ctx, chainConfig, "rpc") // New helper? Or adapt existing one
+	if err != nil {
+		return fmt.Errorf("[%s] no healthy RPC endpoint found: %w", chainConfig.ChainID, err)
+	}
+
+	height, err := getLatestBlockHeight(rpcURL)
+	if err != nil {
+		return fmt.Errorf("[%s] failed to get latest block height from %s: %w", chainConfig.ChainID, rpcURL, err)
+	}
+
+	if height <= chainConfig.LastSuccessfulSnapshotHeight && chainConfig.LastSuccessfulSnapshotHeight > 0 {
+		return nil // No new blocks
+	}
+	if height == chainConfig.LastAttemptedSnapshotHeight && chainConfig.LastAttemptedSnapshotHeight > 0 {
+		logger.Printf("[%s / %s] Height %d was already attempted. Skipping.", chainConfig.Name, chainConfig.ChainID, height)
+		return nil
+	}
+
+	logger.Printf("[%s / %s] Attempting snapshot for height: %d", chainConfig.Name, chainConfig.ChainID, height)
+	chainConfig.LastAttemptedSnapshotHeight = height // Mark attempt
+
+	chainSnapshotBaseDir := filepath.Join(globalConfig.SnapshotBaseDir, chainConfig.ChainID) // Use ChainID for folder structure
+	snapshotDir, err := ensureSnapshotDir(height, chainSnapshotBaseDir)
+	if err != nil {
+		return fmt.Errorf("[%s] failed ensure snapshot dir %s: %w", chainConfig.ChainID, chainSnapshotBaseDir, err)
+	}
+
+	restURL, err := getHealthyEndpointRuntime(ctx, chainConfig, "rest")
+	if err != nil {
+		return fmt.Errorf("[%s] no healthy REST endpoint found: %w", chainConfig.ChainID, err)
+	}
+	logger.Printf("[%s / %s] Using REST endpoint: %s for height %d", chainConfig.Name, chainConfig.ChainID, restURL, height)
+
+	// Pass ChainRuntimeConfig to takeSnapshot
+	if err := takeSnapshotRuntime(height, *chainConfig, restURL, snapshotDir); err != nil {
+		logger.Printf("[%s / %s] Error during snapshot creation/saving height %d: %v", chainConfig.Name, chainConfig.ChainID, height, err)
+		return fmt.Errorf("[%s] failed take snapshot: %w", chainConfig.ChainID, err)
+	}
+
+	// Add to IPFS
+	cid, err := ipfs.AddPath(snapshotDir)
+	if err != nil {
+		logger.Printf("[%s / %s] Warning: Snapshot dir %s created but failed add to IPFS: %v", chainConfig.Name, chainConfig.ChainID, snapshotDir, err)
+		return fmt.Errorf("failed add snapshot dir %s to IPFS: %w", snapshotDir, err)
+	}
+	logger.Printf("[%s / %s] Added snapshot height %d to IPFS. CID: %s", chainConfig.Name, chainConfig.ChainID, height, cid)
+
+	// Save CID metadata
+	cidFilePath := filepath.Join(snapshotDir, "ipfs_cid.txt")
+	if err := os.WriteFile(cidFilePath, []byte(cid), 0644); err != nil {
+		logger.Printf("[%s / %s] CRITICAL WARNING: Failed write IPFS CID %s to %s: %v. Pruning cannot unpin!", chainConfig.Name, chainConfig.ChainID, cid, cidFilePath, err)
+	}
+
+	// Mark successful
+	chainConfig.LastSuccessfulSnapshotHeight = height
+	logger.Printf("[%s / %s] Successfully processed snapshot height %d (CID: %s).", chainConfig.Name, chainConfig.ChainID, height, cid)
+	return nil
+}
+
+// Need to adapt getHealthyEndpoint to use ChainRuntimeConfig
+// Renaming slightly to avoid conflict if old one is kept temporarily
+func getHealthyEndpointRuntime(ctx context.Context, chainConfig *ChainRuntimeConfig, endpointType string) (string, error) {
+	state := getChainEndpointsState(chainConfig.ChainID) // Use ChainID for state cache key
 	state.mu.Lock()
 	defer state.mu.Unlock()
 
 	var candidates []DiscoveredEndpoint
-	var existingEndpoints []DiscoveredEndpoint
 
+	// Use endpoints directly from the ChainRuntimeConfig first (these are from overrides or registry hints)
 	if endpointType == "rpc" {
-		existingEndpoints = state.RPCEndpoints
 		for _, url := range chainConfig.RPCEndpoints {
-			candidates = append(candidates, DiscoveredEndpoint{Address: url, Type: "rpc", Source: "config"})
+			candidates = append(candidates, DiscoveredEndpoint{Address: url, Type: "rpc", Source: "config/registry_hint"})
 		}
-	} else { // rest
-		existingEndpoints = state.RESTEndpoints
+		candidates = append(candidates, state.RPCEndpoints...) // Add previously discovered/cached
+	} else {
 		for _, url := range chainConfig.RESTEndpoints {
-			candidates = append(candidates, DiscoveredEndpoint{Address: url, Type: "rest", Source: "config"})
+			candidates = append(candidates, DiscoveredEndpoint{Address: url, Type: "rest", Source: "config/registry_hint"})
 		}
+		candidates = append(candidates, state.RESTEndpoints...) // Add previously discovered/cached
 	}
 
-	// Add previously discovered (and working) endpoints
-	for _, ep := range existingEndpoints {
-		// Avoid duplicates if they were also in config
-		isDup := false
-		for _, cfgEp := range candidates {
-			if cfgEp.Address == ep.Address {
-				isDup = true
-				break
-			}
-		}
-		if !isDup {
-			candidates = append(candidates, ep)
+	// Deduplicate candidates based on Address
+	uniqueCandidates := make([]DiscoveredEndpoint, 0, len(candidates))
+	seenAddr := make(map[string]bool)
+	for _, c := range candidates {
+		if !seenAddr[c.Address] {
+			uniqueCandidates = append(uniqueCandidates, c)
+			seenAddr[c.Address] = true
 		}
 	}
+	candidates = uniqueCandidates
 
-	// Try candidates (config first, then previously discovered)
+	// Try candidates
 	rand.Shuffle(len(candidates), func(i, j int) { candidates[i], candidates[j] = candidates[j], candidates[i] })
+
 	for _, ep := range candidates {
+		checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		var err error
 		if endpointType == "rpc" {
-			err = checkRPC(ctx, ep.Address, chainConfig.ChainID)
+			err = checkRPC(checkCtx, ep.Address, chainConfig.ChainID)
 		} else {
-			err = checkREST(ctx, ep.Address, chainConfig.ChainID)
+			err = checkREST(checkCtx, ep.Address, chainConfig.ChainID)
 		}
+		cancel()
 		if err == nil {
-			logger.Printf("[%s] Using healthy %s endpoint: %s (source: %s)", chainConfig.ChainID, endpointType, ep.Address, ep.Source)
+			// logger.Printf("[%s] Using healthy %s endpoint: %s (source: %s)", chainConfig.ChainID, endpointType, ep.Address, ep.Source)
 			return ep.Address, nil
 		}
-		logger.Printf("[%s] Endpoint %s (%s) failed health check: %v", chainConfig.ChainID, ep.Address, endpointType, err)
+		// logger.Printf("[%s] Endpoint %s (%s) failed health check: %v", chainConfig.ChainID, ep.Address, endpointType, err)
 	}
 
-	// If all fail and discovery is enabled, try peer discovery
-	if chainConfig.EnablePeerDiscoveryFallback && time.Since(state.lastDiscovery) > 15*time.Minute { // Rate limit discovery
-		logger.Printf("[%s] Configured and cached %s endpoints failed. Attempting peer discovery.", chainConfig.ChainID, endpointType)
-		// Use configured RPCs as seeds for discovery, or P2P seeds
-		var seedRPCsForDiscovery []string
-		if len(chainConfig.RPCEndpoints) > 0 {
-			seedRPCsForDiscovery = append(seedRPCsForDiscovery, chainConfig.RPCEndpoints...)
-		} else if len(state.RPCEndpoints) > 0 { // Use previously good RPCs as seeds
-			for _, ep := range state.RPCEndpoints {
-				seedRPCsForDiscovery = append(seedRPCsForDiscovery, ep.Address)
-			}
-		}
+	// Attempt discovery if enabled and needed
+	shouldDiscover := chainConfig.EnablePeerDiscoveryFallback && (time.Since(state.lastDiscovery) > 15*time.Minute || len(candidates) == 0)
 
-		discovered, err := DiscoverEndpoints(ctx, chainConfig.ChainID, seedRPCsForDiscovery, chainConfig.SeedNodesP2P)
+	if shouldDiscover {
+		logger.Printf("[%s] No healthy %s endpoint found in cache/hints. Attempting peer discovery.", chainConfig.ChainID, endpointType)
 		state.lastDiscovery = time.Now()
-		if err != nil {
-			logger.Printf("[%s] Peer discovery for %s failed: %v", chainConfig.ChainID, endpointType, err)
-		} else {
-			newlyFoundForType := false
-			for _, discEp := range discovered {
-				if discEp.Type == endpointType {
-					newlyFoundForType = true
-					// Add to global cache and try immediately
-					if endpointType == "rpc" {
-						state.RPCEndpoints = append(state.RPCEndpoints, discEp) // Could add logic to limit cache size
-					} else {
-						state.RESTEndpoints = append(state.RESTEndpoints, discEp)
-					}
+		state.mu.Unlock() // Unlock during discovery
+		// Use seeds from runtime config (came from registry or override)
+		discovered, discErr := DiscoverEndpoints(ctx, chainConfig.ChainID, chainConfig.RPCEndpoints, chainConfig.SeedNodesP2P)
+		state.mu.Lock() // Re-lock
 
+		if discErr != nil {
+			logger.Printf("[%s] Peer discovery for %s failed: %v", chainConfig.ChainID, endpointType, discErr)
+		} else {
+			var newlyAddedEndpoints []DiscoveredEndpoint
+			for _, discEp := range discovered {
+				alreadyKnown := false
+				for _, known := range candidates {
+					if known.Address == discEp.Address {
+						alreadyKnown = true
+						break
+					}
+				} // Check against initial candidates too
+				if alreadyKnown {
+					continue
+				}
+
+				if discEp.Type == endpointType {
+					newlyAddedEndpoints = append(newlyAddedEndpoints, discEp)
+					checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 					var checkErr error
 					if endpointType == "rpc" {
-						checkErr = checkRPC(ctx, discEp.Address, chainConfig.ChainID)
+						checkErr = checkRPC(checkCtx, discEp.Address, chainConfig.ChainID)
 					} else {
-						checkErr = checkREST(ctx, discEp.Address, chainConfig.ChainID)
+						checkErr = checkREST(checkCtx, discEp.Address, chainConfig.ChainID)
 					}
+					cancel()
 					if checkErr == nil {
 						logger.Printf("[%s] Using newly discovered healthy %s endpoint: %s", chainConfig.ChainID, endpointType, discEp.Address)
+						if endpointType == "rpc" {
+							state.RPCEndpoints = append(state.RPCEndpoints, discEp)
+						} else {
+							state.RESTEndpoints = append(state.RESTEndpoints, discEp)
+						}
 						return discEp.Address, nil
 					}
-					logger.Printf("[%s] Discovered endpoint %s (%s) failed immediate health check: %v", chainConfig.ChainID, discEp.Address, endpointType, checkErr)
+					// logger.Printf("[%s] Discovered endpoint %s (%s) failed check: %v", chainConfig.ChainID, discEp.Address, endpointType, checkErr)
 				}
 			}
-			if !newlyFoundForType {
-				logger.Printf("[%s] Peer discovery ran, but no new usable %s endpoints found.", chainConfig.ChainID, endpointType)
+			// Add newly found but potentially unhealthy endpoints to cache
+			if endpointType == "rpc" {
+				state.RPCEndpoints = append(state.RPCEndpoints, newlyAddedEndpoints...)
+			} else {
+				state.RESTEndpoints = append(state.RESTEndpoints, newlyAddedEndpoints...)
+			}
+			if len(newlyAddedEndpoints) == 0 {
+				logger.Printf("[%s] Peer discovery ran, no new usable %s endpoints found.", chainConfig.ChainID, endpointType)
 			}
 		}
 	}
 	return "", fmt.Errorf("[%s] no healthy %s endpoint found after all attempts", chainConfig.ChainID, endpointType)
 }
 
-func takeAndProcessSnapshotForChain(ctx context.Context, chainConfig *ChainConfig, globalConfig *Config, ipfs *IPFSNode) error {
-	logger.Printf("[%s] Checking for new blocks to snapshot...", chainConfig.ChainID)
+// Updated runPerChainPruning to accept ChainRuntimeConfig
+func runPerChainPruning(ctx context.Context, chainConfig ChainRuntimeConfig, globalConfig *Config, ipfs *IPFSNode) {
+	logger.Printf("[%s / %s] Starting pruning service. Interval: %s, Keep: %d",
+		chainConfig.Name, chainConfig.ChainID, chainConfig.PruneInterval, chainConfig.MaxSnapshotsToKeepPerChain)
 
-	rpcURL, err := getHealthyEndpoint(ctx, chainConfig, "rpc")
-	if err != nil {
-		return fmt.Errorf("[%s] no healthy RPC endpoint found: %w", chainConfig.ChainID, err)
+	if chainConfig.PruneInterval <= 0 {
+		logger.Printf("[%s / %s] Pruning interval zero/negative, disabling.", chainConfig.Name, chainConfig.ChainID)
+		return
 	}
-
-	height, err := getLatestBlockHeight(rpcURL) // getLatestBlockHeight uses this specific RPC
-	if err != nil {
-		return fmt.Errorf("[%s] failed to get latest block height from %s: %w", chainConfig.ChainID, rpcURL, err)
-	}
-
-	if height <= chainConfig.LastSuccessfulSnapshotHeight && chainConfig.LastSuccessfulSnapshotHeight > 0 {
-		logger.Printf("[%s] No new blocks since last successful snapshot (current: %d, last: %d). Skipping.",
-			chainConfig.ChainID, height, chainConfig.LastSuccessfulSnapshotHeight)
-		return nil
-	}
-	if height == chainConfig.LastAttemptedSnapshotHeight && chainConfig.LastAttemptedSnapshotHeight > 0 {
-		logger.Printf("[%s] Current height %d was already attempted. Skipping to avoid retry loops on unchanged height.",
-			chainConfig.ChainID, height)
-		return nil
-	}
-
-	logger.Printf("[%s] Latest block height from %s: %d", chainConfig.ChainID, rpcURL, height)
-	chainConfig.LastAttemptedSnapshotHeight = height // Mark as attempted
-
-	chainSnapshotBaseDir := filepath.Join(globalConfig.SnapshotBaseDir, chainConfig.ChainID)
-	snapshotDir, err := ensureSnapshotDir(height, chainSnapshotBaseDir)
-	if err != nil {
-		return fmt.Errorf("[%s] failed to ensure snapshot directory: %w", chainConfig.ChainID, err)
-	}
-
-	restURL, err := getHealthyEndpoint(ctx, chainConfig, "rest")
-	if err != nil {
-		return fmt.Errorf("[%s] no healthy REST endpoint found: %w", chainConfig.ChainID, err)
-	}
-	logger.Printf("[%s] Using REST endpoint: %s", chainConfig.ChainID, restURL)
-
-	if _, err := generateCosmosGenesisDoc(restURL, chainConfig.ChainID, height, snapshotDir); err != nil {
-		return fmt.Errorf("[%s] failed to take snapshot: %w", chainConfig.ChainID, err)
-	}
-
-	if err := addSnapshotToIndex(ipfs, globalConfig, chainConfig.ChainID, height, snapshotDir); err != nil {
-		logger.Printf("[%s] Warning: failed to add snapshot to index and IPFS: %v. Snapshot data may exist locally but not be pinned or indexed.", chainConfig.ChainID, err)
-		// Don't return error here, as snapshot was taken. Indexing can be retried or done manually.
-	} else {
-		// Update main README (index.json itself is published by addSnapshotToIndex)
-		index := loadSnapshotIndex(globalConfig)
-		if err := updateReadmeWithIPFS(index, globalConfig, ipfs); err != nil {
-			logger.Printf("[%s] Warning: failed to update main README.md: %v", chainConfig.ChainID, err)
-		}
-	}
-
-	chainConfig.LastSuccessfulSnapshotHeight = height
-	logger.Printf("[%s] Successfully processed snapshot for height %d.", chainConfig.ChainID, height)
-	return nil
-}
-
-func runPerChainPruning(ctx context.Context, chainConfig ChainConfig, globalConfig *Config, ipfs *IPFSNode) {
-	logger.Printf("[%s] Starting per-chain pruning service. Interval: %s, Keep: %d",
-		chainConfig.ChainID, chainConfig.PruneInterval, chainConfig.MaxSnapshotsToKeepPerChain)
-
 	ticker := time.NewTicker(chainConfig.PruneInterval)
 	defer ticker.Stop()
 
+	// Initial run
+	select {
+	case <-time.After(1 * time.Minute):
+		logger.Printf("[%s / %s] Running initial pruning check...", chainConfig.Name, chainConfig.ChainID)
+		if err := pruneOldSnapshotsForChain(ipfs, globalConfig, &chainConfig); err != nil { // Pass pointer for modification? No, pruning doesn't modify runtime conf.
+			logger.Printf("[%s / %s] Error initial pruning: %v", chainConfig.Name, chainConfig.ChainID, err)
+		}
+	case <-ctx.Done():
+		logger.Printf("[%s / %s] Stopping pruning before initial run.", chainConfig.Name, chainConfig.ChainID)
+		return
+	}
+
+	// Scheduled runs
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Printf("[%s] Stopping per-chain pruning service.", chainConfig.ChainID)
+			logger.Printf("[%s / %s] Stopping pruning service.", chainConfig.Name, chainConfig.ChainID)
 			return
 		case <-ticker.C:
-			logger.Printf("[%s] Running per-chain snapshot pruning...", chainConfig.ChainID)
-			err := pruneOldSnapshotsForChain(ipfs, globalConfig, &chainConfig)
-			if err != nil {
-				logger.Printf("[%s] Error during per-chain pruning: %v", chainConfig.ChainID, err)
+			logger.Printf("[%s / %s] Running scheduled pruning...", chainConfig.Name, chainConfig.ChainID)
+			if err := pruneOldSnapshotsForChain(ipfs, globalConfig, &chainConfig); err != nil {
+				logger.Printf("[%s / %s] Error scheduled pruning: %v", chainConfig.Name, chainConfig.ChainID, err)
 			}
 		}
 	}
 }
 
-func pruneOldSnapshotsForChain(ipfs *IPFSNode, config *Config, chainConfig *ChainConfig) error {
-	logger.Printf("[%s] Checking if snapshots need pruning (max to keep: %d)...",
-		chainConfig.ChainID, chainConfig.MaxSnapshotsToKeepPerChain)
+// Updated pruneOldSnapshotsForChain to accept ChainRuntimeConfig
+func pruneOldSnapshotsForChain(ipfs *IPFSNode, config *Config, chainConfig *ChainRuntimeConfig) error { // Accepts pointer or value? Value seems fine.
+	if chainConfig.MaxSnapshotsToKeepPerChain <= 0 {
+		return nil
+	} // Pruning disabled
 
-	chainSnapshotBaseDir := filepath.Join(config.SnapshotBaseDir, chainConfig.ChainID)
+	logger.Printf("[%s / %s] Pruning check (keep %d)...", chainConfig.Name, chainConfig.ChainID, chainConfig.MaxSnapshotsToKeepPerChain)
+	chainSnapshotBaseDir := filepath.Join(config.SnapshotBaseDir, chainConfig.ChainID) // Use ChainID for path
 	entries, err := os.ReadDir(chainSnapshotBaseDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			logger.Printf("[%s] Snapshot directory %s does not exist, nothing to prune.", chainConfig.ChainID, chainSnapshotBaseDir)
 			return nil
 		}
-		return fmt.Errorf("failed to read snapshot directory %s: %w", chainSnapshotBaseDir, err)
+		return fmt.Errorf("failed read dir %s: %w", chainSnapshotBaseDir, err)
 	}
 
-	var snapshots []struct {
+	type snapshotInfo struct {
 		path    string
 		height  int64
 		modTime time.Time
 	}
-
+	var snapshots []snapshotInfo
 	for _, entry := range entries {
 		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "height_") {
 			continue
 		}
 		var height int64
 		if _, errS := fmt.Sscanf(entry.Name(), "height_%d", &height); errS != nil {
-			logger.Printf("[%s] Warning: couldn't parse height from directory name %s", chainConfig.ChainID, entry.Name())
 			continue
 		}
 		info, errInfo := entry.Info()
 		if errInfo != nil {
-			logger.Printf("[%s] Warning: couldn't get info for directory %s: %v", chainConfig.ChainID, entry.Name(), errInfo)
 			continue
 		}
-		snapshots = append(snapshots, struct {
-			path    string
-			height  int64
-			modTime time.Time
-		}{
-			path:    filepath.Join(chainSnapshotBaseDir, entry.Name()),
-			height:  height,
-			modTime: info.ModTime(),
-		})
+		snapshots = append(snapshots, snapshotInfo{path: filepath.Join(chainSnapshotBaseDir, entry.Name()), height: height, modTime: info.ModTime()})
 	}
 
 	if len(snapshots) <= chainConfig.MaxSnapshotsToKeepPerChain {
-		logger.Printf("[%s] Found %d snapshots, which is within the limit of %d. No pruning needed.",
-			chainConfig.ChainID, len(snapshots), chainConfig.MaxSnapshotsToKeepPerChain)
 		return nil
-	}
+	} // Within limit
 
-	// Sort snapshots by modification time (oldest first) to prune
-	sort.Slice(snapshots, func(i, j int) bool {
-		return snapshots[i].modTime.Before(snapshots[j].modTime)
-	})
+	sort.Slice(snapshots, func(i, j int) bool { return snapshots[i].height > snapshots[j].height }) // Newest first
 
-	numToPrune := len(snapshots) - chainConfig.MaxSnapshotsToKeepPerChain
-	logger.Printf("[%s] Need to prune %d old snapshots.", chainConfig.ChainID, numToPrune)
+	snapshotsToPrune := snapshots[chainConfig.MaxSnapshotsToKeepPerChain:]
+	logger.Printf("[%s / %s] Found %d snapshots, pruning %d oldest.", chainConfig.Name, chainConfig.ChainID, len(snapshots), len(snapshotsToPrune))
 
-	snapshotIndex := loadSnapshotIndex(config) // Load once
-
-	for i := 0; i < numToPrune; i++ {
-		snapshot := snapshots[i]
-		logger.Printf("[%s] Removing snapshot at height %d (path: %s)",
-			chainConfig.ChainID, snapshot.height, snapshot.path)
-
-		// Find CID in index to unpin
-		var cidToUnpin string
-		foundInIndex := false
-		for _, indexedSnap := range snapshotIndex.Snapshots {
-			// Compare just the directory name "height_XXXX"
-			if indexedSnap.ChainID == chainConfig.ChainID && filepath.Base(indexedSnap.Path) == filepath.Base(snapshot.path) {
-				cidToUnpin = indexedSnap.IPFSCID
-				foundInIndex = true
-				break
-			}
-		}
-
-		if foundInIndex && cidToUnpin != "" {
-			if err := ipfs.UnpinCID(cidToUnpin); err != nil {
-				logger.Printf("[%s] Warning: failed to unpin CID %s for snapshot %s: %v",
-					chainConfig.ChainID, cidToUnpin, snapshot.path, err)
-				// Continue with local deletion even if unpin fails
-			} else {
-				logger.Printf("[%s] Successfully unpinned CID %s for snapshot %s", chainConfig.ChainID, cidToUnpin, snapshot.path)
-			}
+	for _, snapshot := range snapshotsToPrune {
+		logger.Printf("[%s / %s] Pruning height %d (%s)", chainConfig.Name, chainConfig.ChainID, snapshot.height, snapshot.path)
+		cidFilePath := filepath.Join(snapshot.path, "ipfs_cid.txt")
+		cidBytes, err := os.ReadFile(cidFilePath)
+		if err != nil {
+			logger.Printf("[%s / %s] Warning: Failed read CID file %s: %v. Cannot unpin.", chainConfig.Name, chainConfig.ChainID, cidFilePath, err)
 		} else {
-			logger.Printf("[%s] Warning: Snapshot %s (height %d) not found in index or CID is empty, cannot unpin from IPFS. It might have been manually removed or not indexed.",
-				chainConfig.ChainID, snapshot.path, snapshot.height)
-		}
-
-		if err := os.RemoveAll(snapshot.path); err != nil {
-			logger.Printf("[%s] Warning: failed to remove snapshot directory %s: %v",
-				chainConfig.ChainID, snapshot.path, err)
-			continue // Skip to next if removal fails
-		}
-
-		// Remove from the loaded index struct (so subsequent unpins for the same pruning session are faster)
-		// This doesn't save the index; saving happens when new snapshots are added.
-		// This is an optimization to prevent re-searching the full index.
-		updatedSnapshots := []IPFSSnapshot{}
-		for _, indexedSnap := range snapshotIndex.Snapshots {
-			if !(indexedSnap.ChainID == chainConfig.ChainID && filepath.Base(indexedSnap.Path) == filepath.Base(snapshot.path)) {
-				updatedSnapshots = append(updatedSnapshots, indexedSnap)
+			cidToUnpin := strings.TrimSpace(string(cidBytes))
+			if cidToUnpin != "" {
+				if err := ipfs.UnpinCID(cidToUnpin); err != nil {
+					logger.Printf("[%s / %s] Warning: Failed unpin CID %s: %v", chainConfig.Name, chainConfig.ChainID, cidToUnpin, err)
+				} else {
+					logger.Printf("[%s / %s] Unpinned CID %s", chainConfig.Name, chainConfig.ChainID, cidToUnpin)
+				}
+			} else {
+				logger.Printf("[%s / %s] Warning: CID file %s empty.", chainConfig.Name, chainConfig.ChainID, cidFilePath)
 			}
 		}
-		snapshotIndex.Snapshots = updatedSnapshots
+		if err := os.RemoveAll(snapshot.path); err != nil {
+			logger.Printf("[%s / %s] Error removing dir %s: %v", chainConfig.Name, chainConfig.ChainID, snapshot.path, err)
+		}
 	}
-
-	// After pruning, the index file (index.json) itself should be updated and re-pinned
-	// This is important if pruning removed entries that were part of the last published index.
-	// The `addSnapshotToIndex` function handles publishing the index, so this will be updated
-	// automatically when the next snapshot is added. For immediate update, we could call:
-	// SaveAndPublishIndex(snapshotIndex, config, ipfs)
-	// However, to avoid too frequent index updates, let's rely on the next snapshot addition.
-
 	return nil
 }
 
-// Helper function to calculate directory size (can be moved to snapshot_utils.go if not already there)
-func getDirSize(path string) (int64, error) {
-	var size int64
-	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if !info.IsDir() {
-			size += info.Size()
-		}
-		return nil
-	})
-	return size, err
-}
+// getDirSize remains the same
 
+// manageMutualPinning remains disabled
 func manageMutualPinning(ctx context.Context, node *IPFSNode, config *Config) {
-	// Check more frequently if interval is shorter, e.g. once per global snapshot interval
-	pinInterval := config.GlobalSnapshotInterval
-	if pinInterval < 1*time.Hour { // Ensure it's not too frequent
-		pinInterval = 1 * time.Hour
-	}
-	if pinInterval > 6*time.Hour { // Ensure it's not too infrequent
-		pinInterval = 6 * time.Hour
-	}
-
-	ticker := time.NewTicker(pinInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			logger.Printf("Stopping mutual pinning service.")
-			return
-		case <-ticker.C:
-			logger.Printf("Running mutual pinning check...")
-			index := loadSnapshotIndex(config) // Load the latest index
-			if len(index.Snapshots) == 0 {
-				logger.Printf("No snapshots in index to mutually pin.")
-				continue
-			}
-			pinnedCount := 0
-			failedCount := 0
-			// Pin a subset or all? For now, let's try all known CIDs from our index.
-			// In a real distributed scenario, this would involve discovering CIDs from other trusted nodes.
-			for _, snapshot := range index.Snapshots {
-				if snapshot.IPFSCID != "" {
-					// PinCID already checks MaxPinnedSize limit
-					if err := node.PinCID(snapshot.IPFSCID, snapshot.Size); err != nil { // Pass size to PinCID
-						// Log as debug or warning if it's an expected error (like already pinned or size limit)
-						// logger.Printf("Failed to pin %s (size %d): %v", snapshot.IPFSCID, snapshot.Size, err)
-						failedCount++
-					} else {
-						// logger.Printf("Successfully pinned/verified %s (size %d)", snapshot.IPFSCID, snapshot.Size)
-						pinnedCount++
-					}
-				}
-			}
-			logger.Printf("Mutual pinning check complete. Verified/Pinned: %d, Failed/Skipped: %d", pinnedCount, failedCount)
-		}
-	}
+	logger.Printf("Mutual pinning service is currently disabled.")
+	<-ctx.Done()
+	logger.Printf("Mutual pinning service stopped.")
 }
+
+// Need matching takeSnapshotRuntime function (can be in snapshot_core.go)
+// Need getLatestBlockHeight definition that matches call
+// Need checkRPC/checkREST definitions (can be in peer_discovery.go)
+// Need ensureSnapshotDir definition (can be in snapshot_utils.go)

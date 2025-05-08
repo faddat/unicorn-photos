@@ -7,11 +7,11 @@ log_level = "info" # e.g., debug, info, warn, error
 # --- Chain Source & Filtering ---
 # Path to the local clone of the cosmos/chain-registry repository
 # Required if all_chains = true OR if chains_to_snapshot is used
-chain_registry_path = "~/cosmos-chain-registry" # REQUIRED - Set this path
+chain_registry_path = "~/.chain-registry"
 
 # Set to true to attempt snapshotting ALL 'mainnet' chains found in the registry.
 # If true, 'chains_to_snapshot' is ignored. Overrides in [[chains]] still apply.
-all_chains = false
+all_chains = true
 
 # If all_chains = false, snapshot only these specific chains (names from registry folders).
 # Overrides in [[chains]] can modify these. If this list is empty, ONLY chains
@@ -28,6 +28,19 @@ global_prune_interval = "1h" # Default frequency to check for pruning per chain
 # 1. Override settings for chains selected via 'all_chains' or 'chains_to_snapshot'.
 # 2. Explicitly define chains to snapshot if 'all_chains=false' and 'chains_to_snapshot' is empty.
 # 3. Add chains NOT present in the registry (must provide chain_id and seeds).
+
+# IPFS bootstrap peers (optional, adds to default IPFS bootstrap list)
+bootstrap_peers = [
+  "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+  "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
+  "/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+  "/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt"
+]
+
+# This section allows you to configure snapshots for specific chains.
+# If you want to snapshot a chain that is not in the registry, you can add it here.
+# If you want to override the global settings for a specific chain, you can do so here.
+# If you want to disable a chain from being snapshot, you can set enabled = false.
 
 [[chains]]
 # 'name' here MUST match the folder name in the chain-registry if overriding.
@@ -51,12 +64,10 @@ name = "juno"
 enabled = true
 
 [[chains]]
-name = "some-local-testnet" # Example: Chain not in registry
+name = "some-local-testnet"  # Unique identifier
+chain_id = "local-1"  # Must match Chain ID on network
 enabled = true
-chain_id = "local-1" # MUST be provided if not in registry
 snapshot_interval = "15m"
-# MUST provide seeds if not in registry
 seed_nodes_p2p = ["seed@127.0.0.1:26656"]
-# Optional: provide direct endpoints if preferred over discovery
 rpc_endpoints = ["http://127.0.0.1:26657"]
 rest_endpoints = ["http://127.0.0.1:1317"]

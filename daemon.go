@@ -107,6 +107,10 @@ func runDaemon(ctx context.Context) error {
 
 	logger.Printf("Starting Unicorn Photos IPFS snapshot daemon")
 
+	// Override config to set all_chains to true
+	config.AllChains = true
+	logger.Printf("Setting all_chains=true to process all chains in the registry")
+
 	// --- Determine and Manage Chain Registry Path ---
 	userHome, err := os.UserHomeDir()
 	if err != nil {
@@ -129,19 +133,24 @@ func runDaemon(ctx context.Context) error {
 	effectiveRegistryPath = filepath.Clean(effectiveRegistryPath)
 
 	// Check if the effective path matches the default managed path
-	if effectiveRegistryPath == defaultManagedPath {
+	if effectiveRegistryPath == defaultManagedPath || strings.Contains(effectiveRegistryPath, ".chain-registry") {
 		useManagedDefault = true
 	}
 
 	registryPathToLoad := effectiveRegistryPath // This path will be passed to LoadRegistryChains
 
 	if useManagedDefault {
-		logger.Printf("Managing chain registry at default location: %s", defaultManagedPath)
-		registryPathToLoad = defaultManagedPath // Ensure we use the resolved default path
-		_, err := os.Stat(defaultManagedPath)
+		logger.Printf("Managing chain registry at location: %s", effectiveRegistryPath)
+		registryPathToLoad = effectiveRegistryPath // Ensure we use the resolved path
+		_, err := os.Stat(effectiveRegistryPath)
 		if os.IsNotExist(err) {
-			logger.Printf("Cloning cosmos/chain-registry to %s...", defaultManagedPath)
-			gitErr := runGitCommand(ctx, 2*time.Minute, defaultManagedPath, "clone", "https://github.com/cosmos/chain-registry", ".")
+			// Create parent directory if needed
+			if err := os.MkdirAll(filepath.Dir(effectiveRegistryPath), 0755); err != nil {
+				logger.Printf("ERROR: Failed to create parent directory for chain registry: %v", err)
+			}
+
+			logger.Printf("Cloning cosmos/chain-registry to %s...", effectiveRegistryPath)
+			gitErr := runGitCommand(ctx, 2*time.Minute, "", "clone", "https://github.com/cosmos/chain-registry", effectiveRegistryPath)
 			if gitErr != nil {
 				logger.Printf("ERROR: Failed to clone chain registry: %v. Registry data may be unavailable.", gitErr)
 				// Proceed, LoadRegistryChains should handle missing dir
@@ -149,33 +158,49 @@ func runDaemon(ctx context.Context) error {
 				logger.Printf("Chain registry successfully cloned.")
 			}
 		} else if err == nil { // Directory exists
-			if isGitRepo(defaultManagedPath) {
-				logger.Printf("Updating chain registry at %s...", defaultManagedPath)
-				gitErr := runGitCommand(ctx, 1*time.Minute, defaultManagedPath, "fetch", "origin")
+			if isGitRepo(effectiveRegistryPath) {
+				logger.Printf("Updating chain registry at %s...", effectiveRegistryPath)
+				gitErr := runGitCommand(ctx, 1*time.Minute, effectiveRegistryPath, "fetch", "origin")
 				if gitErr == nil {
-					gitErr = runGitCommand(ctx, 1*time.Minute, defaultManagedPath, "reset", "--hard", "origin/main")
+					gitErr = runGitCommand(ctx, 1*time.Minute, effectiveRegistryPath, "reset", "--hard", "origin/main")
 				}
 				if gitErr != nil {
-					logger.Printf("Warning: Failed to update chain registry git repo at %s: %v. Using existing local data.", defaultManagedPath, gitErr)
+					logger.Printf("Warning: Failed to update chain registry git repo at %s: %v. Using existing local data.", effectiveRegistryPath, gitErr)
 				} else {
 					logger.Printf("Chain registry successfully updated.")
 				}
 			} else {
-				logger.Printf("Warning: Path %s exists but is not a git repository. Using as is, updates disabled.", defaultManagedPath)
+				logger.Printf("Warning: Path %s exists but is not a git repository. Using as is, updates disabled.", effectiveRegistryPath)
 			}
 		} else { // Other error stating the directory
-			logger.Printf("Error checking chain registry path %s: %v. Trying to proceed.", defaultManagedPath, err)
+			logger.Printf("Error checking chain registry path %s: %v. Trying to proceed.", effectiveRegistryPath, err)
 		}
 	} else {
 		logger.Printf("Using user-specified chain registry path: %s", effectiveRegistryPath)
 	}
 
 	logger.Printf("Snapshot Base Directory: %s", config.SnapshotBaseDir)
-	logger.Printf("Chain Registry Path: %s", config.ChainRegistryPath)
+	logger.Printf("Chain Registry Path: %s", effectiveRegistryPath)
 	logger.Printf("Snapshot All Chains: %t", config.AllChains)
 	if !config.AllChains {
 		logger.Printf("Specific Chains to Snapshot: %v", config.ChainsToSnapshot)
 	}
+
+	// --- Resolve IPFS repo path ---
+	// Ensure the path is absolute with ~ expanded
+	resolvedIPFSPath := config.IPFSRepoPath
+	if strings.HasPrefix(resolvedIPFSPath, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("failed to resolve home directory for IPFS path: %w", err)
+		}
+		resolvedIPFSPath = filepath.Join(home, resolvedIPFSPath[2:])
+	}
+	resolvedIPFSPath = filepath.Clean(resolvedIPFSPath)
+	logger.Printf("Using IPFS repository at: %s", resolvedIPFSPath)
+
+	// Update the config with the resolved path
+	config.IPFSRepoPath = resolvedIPFSPath
 
 	ipfs, err := NewIPFSNode(ctx, config)
 	if err != nil {
@@ -355,10 +380,14 @@ func createRuntimeConfig(basicInfo *BasicChainInfo, globalConfig *Config, overri
 		SnapshotIntervalRaw:         globalConfig.GlobalSnapshotIntervalRaw,
 		MaxSnapshotsToKeepPerChain:  globalConfig.GlobalMaxSnapshotsToKeep,
 		PruneInterval:               globalConfig.GlobalPruneInterval,
-		EnablePeerDiscoveryFallback: true, // Default to true if seeds are available
+		EnablePeerDiscoveryFallback: true, // Always enable peer discovery
 		// Data from registry
-		SeedNodesP2P: getP2PAddresses(basicInfo.Peers.Seeds), // Add persistent peers too? Maybe config option.
-		// Optionally add registry API endpoints as hints if available/parsed
+		SeedNodesP2P: getP2PAddresses(basicInfo.Peers.Seeds), // Add persistent peers too if available
+	}
+
+	// Add persistent peers if available
+	if len(basicInfo.Peers.PersistentPeers) > 0 {
+		rt.SeedNodesP2P = append(rt.SeedNodesP2P, getP2PAddresses(basicInfo.Peers.PersistentPeers)...)
 	}
 
 	// Apply overrides
@@ -395,9 +424,9 @@ func createRuntimeConfig(basicInfo *BasicChainInfo, globalConfig *Config, overri
 		}
 	}
 
-	// Disable peer discovery fallback if no seeds are available
-	if len(rt.SeedNodesP2P) == 0 {
-		rt.EnablePeerDiscoveryFallback = false
+	// Always ensure peer discovery is enabled when we have seed nodes
+	if len(rt.SeedNodesP2P) > 0 {
+		rt.EnablePeerDiscoveryFallback = true
 	}
 
 	return rt

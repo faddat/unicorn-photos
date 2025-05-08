@@ -44,7 +44,7 @@ type DiscoveredEndpoint struct {
 // DiscoverEndpoints attempts to find RPC and REST endpoints.
 // Uses seedRPCs for /net_info, p2pSeedNodes for direct IP extraction, then probes.
 func DiscoverEndpoints(ctx context.Context, chainID string, seedRPCs []string, p2pSeedNodes []string) ([]DiscoveredEndpoint, error) {
-	logger.Printf("[%s] Starting endpoint discovery...", chainID)
+	logger.Printf("[%s] Starting endpoint discovery with %d seed RPCs and %d P2P seed nodes...", chainID, len(seedRPCs), len(p2pSeedNodes))
 	var discovered []DiscoveredEndpoint
 	var wg sync.WaitGroup
 	mu := &sync.Mutex{}                 // Protects `discovered` slice and `checkedIPs` map
@@ -56,6 +56,7 @@ func DiscoverEndpoints(ctx context.Context, chainID string, seedRPCs []string, p
 	// 1. Get initial peer IPs from /net_info using provided seedRPCs (these are actual RPC endpoints)
 	logger.Printf("[%s] Discover: Querying seed RPCs for peers: %v", chainID, seedRPCs)
 	peerIPsFromRPC := getPeerIPsFromSeedRPCs(ctx, chainID, seedRPCs)
+	logger.Printf("[%s] Discover: Found %d peer IPs from seed RPCs", chainID, len(peerIPsFromRPC))
 	for _, ip := range peerIPsFromRPC {
 		mu.Lock()
 		if !checkedIPs[ip] {
@@ -74,6 +75,7 @@ func DiscoverEndpoints(ctx context.Context, chainID string, seedRPCs []string, p
 	// 2. Get initial peer IPs from P2P seed node addresses (these are P2P addresses, not necessarily RPCs)
 	logger.Printf("[%s] Discover: Extracting IPs from P2P seed nodes: %v", chainID, p2pSeedNodes)
 	peerIPsFromP2PSeeds := getIPsFromP2PAddresses(p2pSeedNodes)
+	logger.Printf("[%s] Discover: Found %d IPs from P2P seed addresses", chainID, len(peerIPsFromP2PSeeds))
 	for _, ip := range peerIPsFromP2PSeeds {
 		mu.Lock()
 		if !checkedIPs[ip] {
@@ -92,12 +94,24 @@ func DiscoverEndpoints(ctx context.Context, chainID string, seedRPCs []string, p
 	wg.Wait()
 	close(probeSemaphore) // Close semaphore channel once all goroutines are done
 
+	// Count the number of RPC and REST endpoints discovered
+	rpcCount := 0
+	restCount := 0
+	for _, ep := range discovered {
+		if ep.Type == "rpc" {
+			rpcCount++
+		} else if ep.Type == "rest" {
+			restCount++
+		}
+	}
+
 	if len(discovered) == 0 {
 		logger.Printf("[%s] No new viable RPC/REST endpoints were discovered.", chainID)
 		return nil, fmt.Errorf("[%s] no new endpoints discovered after probing", chainID)
 	}
 
-	logger.Printf("[%s] Discovered %d potential new RPC/REST endpoints.", chainID, len(discovered))
+	logger.Printf("[%s] Discovery complete: found %d endpoints (%d RPC, %d REST)",
+		chainID, len(discovered), rpcCount, restCount)
 	return discovered, nil
 }
 

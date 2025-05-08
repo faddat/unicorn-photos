@@ -87,7 +87,7 @@ func LoadConfig() (*Config, error) {
 	viper.SetDefault("log_level", "info")
 	viper.SetDefault("bootstrap_peers", []string{})
 	viper.SetDefault("chain_registry_path", "~/.chain-registry")
-	viper.SetDefault("all_chains", false)
+	viper.SetDefault("all_chains", true)
 	viper.SetDefault("chains_to_snapshot", []string{})
 	viper.SetDefault("global_snapshot_interval", "4h")
 	viper.SetDefault("global_max_snapshots_to_keep", 10)
@@ -144,11 +144,12 @@ func LoadConfig() (*Config, error) {
 	if (cfg.AllChains || len(cfg.ChainsToSnapshot) > 0) && cfg.ChainRegistryPath == "" {
 		return nil, fmt.Errorf("config error: 'chain_registry_path' must be set when 'all_chains' is true or 'chains_to_snapshot' is used")
 	}
-	if cfg.ChainRegistryPath != "" {
-		if _, err := os.Stat(cfg.ChainRegistryPath); os.IsNotExist(err) {
-			return nil, fmt.Errorf("config error: 'chain_registry_path' (%s) does not exist or is not accessible", cfg.ChainRegistryPath)
-		}
-	}
+	// Removed check for registry path existence - daemon will handle cloning if needed
+	// if cfg.ChainRegistryPath != "" {
+	// 	if _, err := os.Stat(cfg.ChainRegistryPath); os.IsNotExist(err) {
+	// 		return nil, fmt.Errorf("config error: 'chain_registry_path' (%s) does not exist or is not accessible", cfg.ChainRegistryPath)
+	// 	}
+	// }
 
 	return &cfg, nil
 }

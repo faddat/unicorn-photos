@@ -35,17 +35,67 @@ type IPFSNode struct {
 func NewIPFSNode(ctx context.Context, appConfig *Config) (*IPFSNode, error) {
 	nodeCtx, cancel := context.WithCancel(ctx)
 
+	// Ensure the repository path exists first
+	logger.Printf("Ensuring IPFS repository directory exists at: %s", appConfig.IPFSRepoPath)
 	if err := os.MkdirAll(appConfig.IPFSRepoPath, 0755); err != nil {
 		cancel()
 		return nil, fmt.Errorf("failed to create IPFS repo directory %s: %w", appConfig.IPFSRepoPath, err)
 	}
 
+	// --- Load IPFS plugins early ---
+	plugins, err := loader.NewPluginLoader("")
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("error loading IPFS plugins: %w", err)
+	}
+	if err := plugins.Initialize(); err != nil {
+		cancel()
+		return nil, fmt.Errorf("error initializing IPFS plugins: %w", err)
+	}
+	if err := plugins.Inject(); err != nil {
+		cancel()
+		return nil, fmt.Errorf("error injecting IPFS plugins: %w", err)
+	}
+	logger.Printf("IPFS plugins loaded.")
+
+	// Define datastore spec function that uses the built-in flatfs datastore
+	// instead of pebble which requires plugin support
+	datastoreSpec := func() map[string]interface{} {
+		return map[string]interface{}{
+			"type": "mount",
+			"mounts": []interface{}{
+				map[string]interface{}{
+					"mountpoint": "/blocks",
+					"type":       "flatfs",
+					"path":       "blocks",
+					"sync":       false,
+					"shardFunc":  "/repo/flatfs/shard/v1/next-to-last/2",
+				},
+				map[string]interface{}{
+					"mountpoint":  "/",
+					"type":        "levelds",
+					"path":        "datastore",
+					"compression": "none",
+				},
+			},
+		}
+	}
+
 	if !fsrepo.IsInitialized(appConfig.IPFSRepoPath) {
+		logger.Printf("Initializing new IPFS repository at %s with standard datastore", appConfig.IPFSRepoPath)
+
+		// Generate config with identity (RSA key) - following Kubo's Init()
 		cfg, err := config.Init(os.Stdout, 2048)
 		if err != nil {
 			cancel()
-			return nil, fmt.Errorf("failed to create default IPFS config: %w", err)
+			return nil, fmt.Errorf("failed to create IPFS identity and config: %w", err)
 		}
+
+		// Use the default flatfs+levelds datastore spec instead of pebble
+		// that requires additional plugin registration
+		cfg.Datastore.Spec = datastoreSpec()
+
+		// Set addresses configuration
 		cfg.Addresses.Swarm = []string{
 			"/ip4/0.0.0.0/tcp/4001",
 			"/ip6/::/tcp/4001",
@@ -54,44 +104,32 @@ func NewIPFSNode(ctx context.Context, appConfig *Config) (*IPFSNode, error) {
 		}
 		cfg.Addresses.API = []string{"/ip4/127.0.0.1/tcp/5001"}
 		cfg.Addresses.Gateway = []string{"/ip4/127.0.0.1/tcp/8080"}
+
+		// Override bootstrap peers if provided in app config
 		if len(appConfig.BootstrapPeers) > 0 {
 			cfg.Bootstrap = appConfig.BootstrapPeers
 		}
+
+		// Initialize the repo with our configuration
 		if err := fsrepo.Init(appConfig.IPFSRepoPath, cfg); err != nil {
 			cancel()
-			return nil, fmt.Errorf("failed to init IPFS repo at %s: %w", appConfig.IPFSRepoPath, err)
+			return nil, fmt.Errorf("failed to initialize IPFS repository at %s: %w", appConfig.IPFSRepoPath, err)
 		}
-		logger.Printf("Initialized new IPFS repository at %s", appConfig.IPFSRepoPath)
+
+		logger.Printf("Successfully initialized IPFS repository with standard datastore")
 	}
 
+	// Now try to open the repo (whether it was initialized programmatically or by the command)
 	repo, err := fsrepo.Open(appConfig.IPFSRepoPath)
 	if err != nil {
 		cancel()
+		// No need to close repo here as it failed to open
 		return nil, fmt.Errorf("failed to open IPFS repo at %s: %w", appConfig.IPFSRepoPath, err)
 	}
 
-	plugins, err := loader.NewPluginLoader("")
-	if err != nil {
-		cancel()
-		if errClose := repo.Close(); errClose != nil {
-			logger.Printf("IPFS: Error closing repo after plugin load failure: %v", errClose)
-		}
-		return nil, fmt.Errorf("error loading IPFS plugins: %w", err)
-	}
-	if err := plugins.Initialize(); err != nil {
-		cancel()
-		if errClose := repo.Close(); errClose != nil {
-			logger.Printf("IPFS: Error closing repo after plugin init failure: %v", errClose)
-		}
-		return nil, fmt.Errorf("error initializing IPFS plugins: %w", err)
-	}
-	if err := plugins.Inject(); err != nil {
-		cancel()
-		if errClose := repo.Close(); errClose != nil {
-			logger.Printf("IPFS: Error closing repo after plugin inject failure: %v", errClose)
-		}
-		return nil, fmt.Errorf("error injecting IPFS plugins: %w", err)
-	}
+	// --- Plugins already loaded above ---
+	// plugins, err := loader.NewPluginLoader("")
+	// ... (removed plugin loading from here)
 
 	nodeOptions := &node.BuildCfg{
 		Online: true,

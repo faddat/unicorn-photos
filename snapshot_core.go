@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -32,142 +35,256 @@ type ExtendedFetchedState struct {
 	Errors        map[string]string          `json:"errors,omitempty"`
 }
 
-// takeSnapshotRuntime is the updated version that fetches more comprehensive state
-func takeSnapshotRuntime(height int64, chainConfig ChainRuntimeConfig, restURL string, snapshotDir string) error {
-	// Create ExtendedFetchedState that will hold all module data dynamically
-	state, err := fetchCompleteChainState(restURL, chainConfig.ChainID, height)
-	if err != nil {
-		return fmt.Errorf("failed to fetch chain state: %w", err)
+// List of standard Cosmos SDK modules to capture
+var standardModules = []string{
+	"auth", "bank", "staking", "distribution",
+	"gov", "slashing", "params", "evidence",
+	"upgrade", "mint", "crisis", "ibc", "feegrant",
+}
+
+// Function to take a snapshot at a specific height
+func takeSnapshotRuntime(height int64, chainConfig ChainRuntimeConfig, restEndpoint, snapshotDir string) error {
+	logger.Printf("[%s] Starting comprehensive snapshot at height %d", chainConfig.ChainID, height)
+
+	// Initialize progress tracker
+	progress := SnapshotProgress{
+		ChainID:          chainConfig.ChainID,
+		Height:           height,
+		StartTime:        time.Now(),
+		TotalModules:     len(standardModules),
+		CompletedModules: []string{},
+		PercentComplete:  0,
 	}
 
-	// Save the extended state to a single comprehensive file
-	completeStatePath := filepath.Join(snapshotDir, "complete_state.json")
-	completeStateJSON, err := json.MarshalIndent(state, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal complete state: %w", err)
-	}
-	if err := os.WriteFile(completeStatePath, completeStateJSON, 0644); err != nil {
-		return fmt.Errorf("failed to write complete state file: %w", err)
-	}
+	// Update status tracker with initial progress
+	statusTracker := GetStatusTracker()
+	status := statusTracker.GetChainStatus(chainConfig.ChainID)
+	status.Status = "active"
+	status.LastProgress = &progress
+	statusTracker.UpdateChainStatus(chainConfig.ChainID, status)
 
-	// Also save individual module states to separate files for easier access
-	for moduleName, moduleData := range state.ModuleStates {
-		moduleFilePath := filepath.Join(snapshotDir, fmt.Sprintf("%s_state.json", moduleName))
-		if err := os.WriteFile(moduleFilePath, moduleData, 0644); err != nil {
-			logger.Printf("[%s] Warning: Failed to write %s module state file: %v",
-				chainConfig.ChainID, moduleName, err)
-		}
+	// Create metadata file with chain info and timestamp
+	metadata := map[string]interface{}{
+		"chain_id":      chainConfig.ChainID,
+		"height":        height,
+		"timestamp":     time.Now().Format(time.RFC3339),
+		"snapshot_tool": "unicorn-photos",
+		"version":       "1.0.0",
 	}
-
-	// Write consensus info to separate file for easy access
-	if state.ConsensusInfo != nil {
-		consensusFilePath := filepath.Join(snapshotDir, "consensus_info.json")
-		consensusJSON, err := json.MarshalIndent(state.ConsensusInfo, "", "  ")
-		if err != nil {
-			logger.Printf("[%s] Warning: Failed to marshal consensus info: %v", chainConfig.ChainID, err)
-		} else {
-			if err := os.WriteFile(consensusFilePath, consensusJSON, 0644); err != nil {
-				logger.Printf("[%s] Warning: Failed to write consensus info file: %v", chainConfig.ChainID, err)
-			}
-		}
-	}
-
-	// Create a metadata file with summary information
-	metadata := struct {
-		ChainID         string    `json:"chain_id"`
-		Height          int64     `json:"height"`
-		Timestamp       time.Time `json:"timestamp"`
-		ModulesCaptured []string  `json:"modules_captured"`
-		ErrorCount      int       `json:"error_count"`
-	}{
-		ChainID:         state.ChainID,
-		Height:          state.Height,
-		Timestamp:       state.Timestamp,
-		ModulesCaptured: state.ModulesFound,
-		ErrorCount:      len(state.Errors),
-	}
-
 	metadataJSON, err := json.MarshalIndent(metadata, "", "  ")
-	if err != nil {
-		logger.Printf("[%s] Warning: Failed to marshal metadata: %v", chainConfig.ChainID, err)
-	} else {
-		metadataPath := filepath.Join(snapshotDir, "metadata.json")
-		if err := os.WriteFile(metadataPath, metadataJSON, 0644); err != nil {
+	if err == nil {
+		if err := os.WriteFile(filepath.Join(snapshotDir, "metadata.json"), metadataJSON, 0644); err != nil {
 			logger.Printf("[%s] Warning: Failed to write metadata file: %v", chainConfig.ChainID, err)
 		}
 	}
 
-	logger.Printf("[%s] Successfully saved state snapshot with %d modules at height %d",
-		chainConfig.ChainID, len(state.ModulesFound), height)
-	return nil
-}
+	// Create a context with timeout for the whole operation
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
 
-// fetchCompleteChainState fetches consensus info and all module states
-func fetchCompleteChainState(restURL, chainID string, height int64) (*ExtendedFetchedState, error) {
-	state := &ExtendedFetchedState{
-		ChainID:      chainID,
-		Height:       height,
-		Timestamp:    time.Now().UTC(),
-		ModuleStates: make(map[string]json.RawMessage),
-		Errors:       make(map[string]string),
+	// Channels for results and errors
+	type moduleResult struct {
+		name  string
+		data  json.RawMessage
+		error error
 	}
+	resultCh := make(chan moduleResult, len(standardModules))
 
-	// 1. Fetch consensus info first
-	consensusInfo, err := fetchConsensusInfo(restURL, chainID, height)
-	if err != nil {
-		state.Errors["consensus_info"] = err.Error()
-		logger.Printf("[%s] Warning: Failed to fetch consensus info: %v", chainID, err)
-	} else {
-		state.ConsensusInfo = consensusInfo
-	}
+	// Create a semaphore to limit concurrency
+	const maxConcurrentFetches = 4
+	sem := make(chan struct{}, maxConcurrentFetches)
 
-	// 2. Discover all modules
-	modules, err := discoverModules(restURL)
-	if err != nil {
-		state.Errors["module_discovery"] = err.Error()
-		logger.Printf("[%s] Warning: Failed to discover modules: %v", chainID, err)
-
-		// If module discovery fails, fall back to known core modules
-		modules = []string{"auth", "bank", "staking", "gov", "distribution", "slashing"}
-		logger.Printf("[%s] Falling back to known core modules: %v", chainID, modules)
-	}
-
-	// 3. Fetch state for each module concurrently
+	// Track how many modules we're processing
 	var wg sync.WaitGroup
-	var mu sync.Mutex
+	var mu sync.Mutex // For synchronizing progress updates
 
-	for _, moduleName := range modules {
+	// Combine all fetched states
+	completeState := make(map[string]json.RawMessage)
+	var moduleErrors = make(map[string]string)
+	var modulesFound []string
+
+	// Prepare to fetch consensus info
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		sem <- struct{}{}        // Acquire semaphore
+		defer func() { <-sem }() // Release semaphore
+
+		mu.Lock()
+		progress.CurrentModule = "consensus"
+		updateProgress(&progress, chainConfig.ChainID)
+		mu.Unlock()
+
+		// Fetch consensus info like validator set and params
+		consensusInfo, err := fetchConsensusInfo(restEndpoint, chainConfig.ChainID, height)
+		if err != nil {
+			logger.Printf("[%s] Warning: Failed to fetch consensus info: %v", chainConfig.ChainID, err)
+			moduleErrors["consensus"] = err.Error()
+			resultCh <- moduleResult{name: "consensus", error: err}
+			return
+		}
+
+		consensusJSON, err := json.MarshalIndent(consensusInfo, "", "  ")
+		if err != nil {
+			moduleErrors["consensus"] = fmt.Sprintf("failed to marshal consensus info: %v", err)
+			resultCh <- moduleResult{name: "consensus", error: err}
+			return
+		}
+
+		// Write consensus info to file
+		err = os.WriteFile(filepath.Join(snapshotDir, "consensus_info.json"), consensusJSON, 0644)
+		if err != nil {
+			moduleErrors["consensus"] = fmt.Sprintf("failed to write consensus info file: %v", err)
+			resultCh <- moduleResult{name: "consensus", error: err}
+			return
+		}
+
+		mu.Lock()
+		completeState["consensus_info"] = consensusJSON
+		modulesFound = append(modulesFound, "consensus")
+		progress.CompletedModules = append(progress.CompletedModules, "consensus")
+		updateProgress(&progress, chainConfig.ChainID)
+		mu.Unlock()
+
+		resultCh <- moduleResult{name: "consensus", data: consensusJSON}
+	}()
+
+	// Launch goroutines to fetch each module's state
+	for _, moduleName := range standardModules {
 		wg.Add(1)
 		go func(module string) {
 			defer wg.Done()
+			sem <- struct{}{}        // Acquire semaphore
+			defer func() { <-sem }() // Release semaphore
 
-			moduleData, err := fetchModuleState(restURL, module)
-
+			// Update progress
 			mu.Lock()
-			defer mu.Unlock()
+			progress.CurrentModule = module
+			updateProgress(&progress, chainConfig.ChainID)
+			mu.Unlock()
+
+			// Fetch module state - use the context from parent
+			logger.Printf("[%s] Fetching %s module state...", chainConfig.ChainID, module)
+			moduleData, err := fetchModuleState(restEndpoint, module)
 
 			if err != nil {
-				state.Errors[fmt.Sprintf("module_%s", module)] = err.Error()
-				logger.Printf("[%s] Warning: Failed to fetch %s module state: %v", chainID, module, err)
-			} else if moduleData != nil {
-				state.ModuleStates[module] = moduleData
-				// Only add to ModulesFound if we actually got data
-				if !containsString(state.ModulesFound, module) {
-					state.ModulesFound = append(state.ModulesFound, module)
-				}
+				logger.Printf("[%s] Warning: Failed to fetch %s module state: %v", chainConfig.ChainID, module, err)
+				moduleErrors[module] = err.Error()
+				resultCh <- moduleResult{name: module, error: err}
+				return
+			}
+
+			if len(moduleData) == 0 || string(moduleData) == "null" || string(moduleData) == "{}" {
+				logger.Printf("[%s] Module %s returned empty or null data", chainConfig.ChainID, module)
+				resultCh <- moduleResult{name: module, error: fmt.Errorf("empty or null data")}
+				return
+			}
+
+			// Write module state to file
+			err = os.WriteFile(filepath.Join(snapshotDir, module+"_state.json"), moduleData, 0644)
+			if err != nil {
+				moduleErrors[module] = fmt.Sprintf("failed to write %s state file: %v", module, err)
+				resultCh <- moduleResult{name: module, error: err}
+				return
+			}
+
+			// Add to complete state and update progress
+			mu.Lock()
+			completeState[module] = moduleData
+			modulesFound = append(modulesFound, module)
+			progress.CompletedModules = append(progress.CompletedModules, module)
+			updateProgress(&progress, chainConfig.ChainID)
+			mu.Unlock()
+
+			// Send result
+			select {
+			case resultCh <- moduleResult{name: module, data: moduleData}:
+			case <-ctx.Done():
+				// Context was canceled, log and return
+				logger.Printf("[%s] Context canceled while fetching %s module", chainConfig.ChainID, module)
 			}
 		}(moduleName)
 	}
 
-	wg.Wait()
+	// Wait for all goroutines to finish in a separate goroutine
+	go func() {
+		wg.Wait()
+		close(resultCh)
+	}()
 
-	logger.Printf("[%s] Completed state fetch for %d modules with %d errors",
-		chainID, len(state.ModulesFound), len(state.Errors))
+	// Process results as they come in
+	for result := range resultCh {
+		select {
+		case <-ctx.Done():
+			logger.Printf("[%s] Snapshot operation canceled", chainConfig.ChainID)
+			return ctx.Err()
+		default:
+			percentComplete := int((float32(len(progress.CompletedModules)) / float32(progress.TotalModules+1)) * 100)
+			logger.Printf("[%s] Module %s fetched (%d%% complete)",
+				chainConfig.ChainID, result.name, percentComplete)
+		}
+	}
 
-	return state, nil
+	// Create a complete state file containing all fetched module states
+	completeStateData := map[string]interface{}{
+		"chain_id":       chainConfig.ChainID,
+		"height":         height,
+		"timestamp":      time.Now().UTC().Format(time.RFC3339),
+		"consensus_info": completeState["consensus_info"],
+		"modules_found":  modulesFound,
+		"module_states":  completeState,
+	}
+
+	// Write the complete state file
+	completeStateJSON, err := json.MarshalIndent(completeStateData, "", "  ")
+	if err != nil {
+		logger.Printf("[%s] Warning: Failed to marshal complete state: %v", chainConfig.ChainID, err)
+	} else {
+		if err := os.WriteFile(filepath.Join(snapshotDir, "complete_state.json"), completeStateJSON, 0644); err != nil {
+			logger.Printf("[%s] Warning: Failed to write complete state file: %v", chainConfig.ChainID, err)
+		}
+	}
+
+	// If there were errors, write them to a file
+	if len(moduleErrors) > 0 {
+		errorsJSON, err := json.MarshalIndent(moduleErrors, "", "  ")
+		if err != nil {
+			logger.Printf("[%s] Warning: Failed to marshal errors: %v", chainConfig.ChainID, err)
+		} else {
+			if err := os.WriteFile(filepath.Join(snapshotDir, "fetch_errors_state.json"), errorsJSON, 0644); err != nil {
+				logger.Printf("[%s] Warning: Failed to write errors file: %v", chainConfig.ChainID, err)
+			}
+		}
+	}
+
+	// Final update to progress
+	progress.PercentComplete = 100
+	progress.CurrentModule = "complete"
+	status.LastProgress = &progress
+	statusTracker.UpdateChainStatus(chainConfig.ChainID, status)
+
+	logger.Printf("[%s] Completed comprehensive snapshot at height %d with %d modules",
+		chainConfig.ChainID, height, len(modulesFound))
+	return nil
 }
 
-// fetchConsensusInfo gathers essential consensus-related information
+// updateProgress updates the progress in the status tracker
+func updateProgress(progress *SnapshotProgress, chainID string) {
+	progress.PercentComplete = int((float32(len(progress.CompletedModules)) / float32(progress.TotalModules+1)) * 100)
+
+	// Update the status tracker
+	statusTracker := GetStatusTracker()
+	status := statusTracker.GetChainStatus(chainID)
+	status.LastProgress = progress
+	statusTracker.UpdateChainStatus(chainID, status)
+
+	// Log progress
+	logger.Printf("[%s] Progress: %d%% - Module: %s (Completed: %d/%d)",
+		chainID, progress.PercentComplete, progress.CurrentModule,
+		len(progress.CompletedModules), progress.TotalModules+1)
+}
+
+// fetchConsensusInfo retrieves key consensus-related information
 func fetchConsensusInfo(restURL, chainID string, height int64) (*ConsensusInfo, error) {
 	info := &ConsensusInfo{
 		Height:  height,
@@ -175,79 +292,50 @@ func fetchConsensusInfo(restURL, chainID string, height int64) (*ConsensusInfo, 
 		Errors:  make(map[string]string),
 	}
 
-	// 1. Get validator set
-	validatorURL := fmt.Sprintf("%s/cosmos/base/tendermint/v1beta1/validatorsets/latest", restURL)
-	validatorData, err := HTTPGet(validatorURL)
+	// Fetch validator set
+	validatorSetURL := fmt.Sprintf("%s/cosmos/base/tendermint/v1beta1/validatorsets/%d", restURL, height)
+	validatorSetData, err := safeHTTPGet(validatorSetURL)
 	if err != nil {
-		info.Errors["validator_set"] = err.Error()
+		info.Errors["validator_set"] = fmt.Sprintf("failed to fetch validator set: %v", err)
 	} else {
-		info.ValidatorSet = validatorData
+		info.ValidatorSet = validatorSetData
 	}
 
-	// 2. Get consensus parameters
-	paramsURL := fmt.Sprintf("%s/cosmos/base/tendermint/v1beta1/blocks/latest", restURL)
-	paramsData, err := HTTPGet(paramsURL)
+	// Fetch consensus params
+	consensusParamsURL := fmt.Sprintf("%s/cosmos/base/tendermint/v1beta1/params", restURL)
+	consensusParamsData, err := safeHTTPGet(consensusParamsURL)
 	if err != nil {
-		info.Errors["consensus_params"] = err.Error()
+		info.Errors["consensus_params_detail"] = fmt.Sprintf("request to %s failed with status %v: %s",
+			consensusParamsURL, err, consensusParamsData)
 	} else {
+		info.ConsensusParams = consensusParamsData
+	}
+
+	// Fetch last block timestamp
+	blockInfoURL := fmt.Sprintf("%s/cosmos/base/tendermint/v1beta1/blocks/%d", restURL, height)
+	blockData, err := safeHTTPGet(blockInfoURL)
+	if err != nil {
+		info.Errors["block_info"] = fmt.Sprintf("failed to fetch block info: %v", err)
+	} else {
+		// Extract timestamp from block data
 		var blockInfo struct {
 			Block struct {
 				Header struct {
-					Height  string `json:"height"`
-					Time    string `json:"time"`
-					ChainID string `json:"chain_id"`
+					Time string `json:"time"`
 				} `json:"header"`
-				LastCommit struct {
-					Height string `json:"height"`
-				} `json:"last_commit"`
 			} `json:"block"`
 		}
-
-		if err := json.Unmarshal(paramsData, &blockInfo); err == nil {
+		if err := json.Unmarshal(blockData, &blockInfo); err == nil {
 			info.LastBlockTimestamp = blockInfo.Block.Header.Time
-		}
-
-		// Also get actual consensus parameters
-		consensusParamsURL := fmt.Sprintf("%s/cosmos/base/tendermint/v1beta1/params", restURL)
-		consensusParamsData, err := HTTPGet(consensusParamsURL)
-		if err != nil {
-			info.Errors["consensus_params_detail"] = err.Error()
 		} else {
-			info.ConsensusParams = consensusParamsData
+			info.Errors["block_timestamp"] = fmt.Sprintf("failed to parse block timestamp: %v", err)
 		}
 	}
 
 	return info, nil
 }
 
-// discoverModules uses the reflection API to discover all modules
-func discoverModules(restURL string) ([]string, error) {
-	moduleURL := fmt.Sprintf("%s/cosmos/base/reflection/v1beta1/modules", restURL)
-	moduleData, err := HTTPGet(moduleURL)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch modules: %w", err)
-	}
-
-	var moduleResp struct {
-		ModuleVersions []struct {
-			Name    string `json:"name"`
-			Version string `json:"version"`
-		} `json:"module_versions"`
-	}
-
-	if err := json.Unmarshal(moduleData, &moduleResp); err != nil {
-		return nil, fmt.Errorf("failed to parse module response: %w", err)
-	}
-
-	modules := make([]string, 0, len(moduleResp.ModuleVersions))
-	for _, module := range moduleResp.ModuleVersions {
-		modules = append(modules, module.Name)
-	}
-
-	return modules, nil
-}
-
-// fetchModuleState fetches state for a specific module
+// fetchModuleState now optimized for comprehensive state capture
 func fetchModuleState(restURL, moduleName string) (json.RawMessage, error) {
 	// Map of common endpoints patterns for modules
 	endpointPatterns := []string{
@@ -266,29 +354,25 @@ func fetchModuleState(restURL, moduleName string) (json.RawMessage, error) {
 			"/cosmos/bank/v1beta1/params",
 			"/cosmos/bank/v1beta1/supply",
 			"/cosmos/bank/v1beta1/denoms_metadata",
-			// Note: We'll handle balances separately with special logic
+			"/cosmos/bank/v1beta1/balances", // Special pagination handler for this
 		},
 		"staking": {
 			"/cosmos/staking/v1beta1/params",
+			"/cosmos/staking/v1beta1/pool",
 			"/cosmos/staking/v1beta1/validators",
-			"/cosmos/staking/v1beta1/validators?status=BOND_STATUS_UNBONDED",  // Include unbonded validators
-			"/cosmos/staking/v1beta1/validators?status=BOND_STATUS_UNBONDING", // Include unbonding validators
-			"/cosmos/staking/v1beta1/historical_info/latest",
-			"/cosmos/staking/v1beta1/pool", // Staking pool info
+			"/cosmos/staking/v1beta1/delegations",                             // All delegations - might be large
+			"/cosmos/staking/v1beta1/validators?status=BOND_STATUS_UNBONDED",  // Include unbonded
+			"/cosmos/staking/v1beta1/validators?status=BOND_STATUS_UNBONDING", // Include unbonding
+		},
+		"distribution": {
+			"/cosmos/distribution/v1beta1/params",
+			"/cosmos/distribution/v1beta1/community_pool",
 		},
 		"gov": {
 			"/cosmos/gov/v1beta1/params/voting",
 			"/cosmos/gov/v1beta1/params/tallying",
 			"/cosmos/gov/v1beta1/params/deposit",
-			"/cosmos/gov/v1beta1/proposals?proposal_status=1", // Deposit period
-			"/cosmos/gov/v1beta1/proposals?proposal_status=2", // Voting period
-			"/cosmos/gov/v1beta1/proposals?proposal_status=3", // Passed
-			"/cosmos/gov/v1beta1/proposals?proposal_status=4", // Rejected
-		},
-		"distribution": {
-			"/cosmos/distribution/v1beta1/params",
-			"/cosmos/distribution/v1beta1/community_pool",
-			"/cosmos/distribution/v1beta1/validator_outstanding_rewards",
+			"/cosmos/gov/v1beta1/proposals",
 		},
 		"slashing": {
 			"/cosmos/slashing/v1beta1/params",
@@ -298,177 +382,94 @@ func fetchModuleState(restURL, moduleName string) (json.RawMessage, error) {
 			"/ibc/core/client/v1/params",
 			"/ibc/core/connection/v1/connections",
 			"/ibc/core/channel/v1/channels",
-			"/ibc/applications/transfer/v1/params",
-			"/ibc/applications/transfer/v1/denom_traces",
 		},
 	}
 
-	// Collect data from multiple endpoints
-	moduleData := make(map[string]json.RawMessage)
-
-	// Special handling for bank module to fetch complete state including balances
-	if moduleName == "bank" {
-		return fetchBankModuleCompleteState(restURL)
-	}
-
-	// Check if we have special handling for this module
+	// For special module handling with known complex structure
 	if endpoints, ok := specialModuleEndpoints[moduleName]; ok {
+		// Gather data from all endpoints for this module
+		moduleData := make(map[string]json.RawMessage)
+		hasData := false
+
 		for _, endpoint := range endpoints {
-			endpointData, err := safeHTTPGet(fmt.Sprintf("%s%s", restURL, endpoint))
-			if err != nil {
-				continue // Skip failed endpoints
-			}
-
-			// Create endpoint name based on the path
-			parts := strings.Split(endpoint, "/")
-			endpointName := parts[len(parts)-1]
-			// Handle query params in endpoint name
-			if strings.Contains(endpointName, "?") {
-				subParts := strings.Split(endpointName, "?")
-				endpointName = subParts[0] + "_" + strings.ReplaceAll(subParts[1], "=", "_")
-				endpointName = strings.ReplaceAll(endpointName, "&", "_")
-			}
-			moduleData[endpointName] = endpointData
-		}
-	} else {
-		// Try generic patterns for other modules
-		foundAny := false
-		for _, pattern := range endpointPatterns {
-			endpoint := fmt.Sprintf(pattern, moduleName)
-			endpointData, err := safeHTTPGet(fmt.Sprintf("%s%s", restURL, endpoint))
-			if err != nil {
-				continue // Skip failed endpoints
-			}
-
-			parts := strings.Split(endpoint, "/")
-			endpointName := parts[len(parts)-1]
-			moduleData[endpointName] = endpointData
-			foundAny = true
-		}
-
-		if !foundAny {
-			// If no endpoint matched, try a custom module scan for endpoints
-			customEndpoints := scanForModuleEndpoints(restURL, moduleName)
-			for endpoint, data := range customEndpoints {
-				moduleData[endpoint] = data
-			}
-		}
-	}
-
-	if len(moduleData) == 0 {
-		return nil, fmt.Errorf("no data found for module %s", moduleName)
-	}
-
-	// Marshal the collected data
-	return json.Marshal(moduleData)
-}
-
-// fetchBankModuleCompleteState fetches complete bank module state including account balances
-func fetchBankModuleCompleteState(restURL string) (json.RawMessage, error) {
-	bankState := make(map[string]json.RawMessage)
-
-	// 1. Fetch params
-	paramsData, err := safeHTTPGet(fmt.Sprintf("%s%s", restURL, "/cosmos/bank/v1beta1/params"))
-	if err == nil {
-		bankState["params"] = paramsData
-	}
-
-	// 2. Fetch supply
-	supplyData, err := fetchPaginatedResource(restURL, "/cosmos/bank/v1beta1/supply", "supply")
-	if err == nil {
-		bankState["supply"] = supplyData
-	}
-
-	// 3. Fetch denom metadata
-	denomMetadataData, err := fetchPaginatedResource(restURL, "/cosmos/bank/v1beta1/denoms_metadata", "metadatas")
-	if err == nil {
-		bankState["denoms_metadata"] = denomMetadataData
-	}
-
-	// 4. Fetch account balances - this requires first getting all accounts from auth module
-	// and then fetching balances for each account
-	authAccountsData, err := fetchPaginatedResource(restURL, "/cosmos/auth/v1beta1/accounts", "accounts")
-	if err == nil {
-		// Parse accounts to get addresses
-		var accounts []struct {
-			Account struct {
-				Address string `json:"address"`
-			} `json:"account"`
-		}
-
-		if err := json.Unmarshal(authAccountsData, &accounts); err == nil {
-			// Now fetch balances for each account
-			var allBalances []struct {
-				Address string `json:"address"`
-				Coins   []struct {
-					Denom  string `json:"denom"`
-					Amount string `json:"amount"`
-				} `json:"coins"`
-			}
-
-			// Use a limited number of concurrent requests
-			semaphore := make(chan struct{}, 20)
-			var wg sync.WaitGroup
-			var mu sync.Mutex
-
-			for _, acc := range accounts {
-				if acc.Account.Address == "" {
-					continue
+			// Handle special case for paginated resources
+			if strings.Contains(endpoint, "/balances") {
+				// Use pagination for accounts with balances
+				accountsWithBalances, err := fetchPaginatedResource(restURL, endpoint, "balances")
+				if err == nil && len(accountsWithBalances) > 0 {
+					moduleData["balances"] = accountsWithBalances
+					hasData = true
 				}
-
-				wg.Add(1)
-				go func(address string) {
-					defer wg.Done()
-					semaphore <- struct{}{}        // Acquire token
-					defer func() { <-semaphore }() // Release token
-
-					balanceURL := fmt.Sprintf("%s/cosmos/bank/v1beta1/balances/%s", restURL, address)
-					balanceData, err := safeHTTPGet(balanceURL)
-					if err != nil {
-						return
-					}
-
-					var balance struct {
-						Balances []struct {
-							Denom  string `json:"denom"`
-							Amount string `json:"amount"`
-						} `json:"balances"`
-					}
-
-					if err := json.Unmarshal(balanceData, &balance); err != nil {
-						return
-					}
-
-					// Only include if there are balances
-					if len(balance.Balances) > 0 {
-						mu.Lock()
-						allBalances = append(allBalances, struct {
-							Address string `json:"address"`
-							Coins   []struct {
-								Denom  string `json:"denom"`
-								Amount string `json:"amount"`
-							} `json:"coins"`
-						}{
-							Address: address,
-							Coins:   balance.Balances,
-						})
-						mu.Unlock()
-					}
-				}(acc.Account.Address)
+				continue
 			}
 
-			wg.Wait()
-
-			// Add the balances to bank state
-			balancesJSON, err := json.Marshal(allBalances)
-			if err == nil {
-				bankState["balances"] = balancesJSON
+			// Handle special case for delegations (large dataset)
+			if strings.Contains(endpoint, "/delegations") {
+				delegations, err := fetchPaginatedResource(restURL, endpoint, "delegation_responses")
+				if err == nil && len(delegations) > 0 {
+					moduleData["delegations"] = delegations
+					hasData = true
+				}
+				continue
 			}
+
+			// Regular endpoint
+			urlPath := fmt.Sprintf("%s%s", restURL, endpoint)
+			data, err := safeHTTPGet(urlPath)
+			if err != nil {
+				logger.Printf("Warning: Error fetching from %s: %v", urlPath, err)
+				continue
+			}
+
+			if len(data) > 0 && string(data) != "null" && string(data) != "{}" {
+				// For params endpoints, extract the params object
+				if strings.Contains(endpoint, "/params") {
+					var paramsResp struct {
+						Params json.RawMessage `json:"params"`
+					}
+					if json.Unmarshal(data, &paramsResp) == nil && len(paramsResp.Params) > 0 {
+						moduleData[filepath.Base(endpoint)] = paramsResp.Params
+					} else {
+						moduleData[filepath.Base(endpoint)] = data
+					}
+				} else {
+					moduleData[filepath.Base(endpoint)] = data
+				}
+				hasData = true
+			}
+		}
+
+		// If we collected any data, marshal it to JSON and return
+		if hasData {
+			result, err := json.Marshal(moduleData)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal %s module data: %w", moduleName, err)
+			}
+			return result, nil
+		}
+
+		// If no special endpoints succeeded, fall back to general patterns
+	}
+
+	// Try common patterns for any module
+	for _, pattern := range endpointPatterns {
+		endpoint := fmt.Sprintf(pattern, moduleName)
+		urlPath := fmt.Sprintf("%s%s", restURL, endpoint)
+		data, err := safeHTTPGet(urlPath)
+		if err == nil && len(data) > 0 && string(data) != "null" && string(data) != "{}" {
+			return data, nil
 		}
 	}
 
-	// Return the complete bank state
-	return json.Marshal(bankState)
+	// Try to query params for the module (most common endpoint)
+	paramsURL := fmt.Sprintf("%s/cosmos/%s/v1beta1/params", restURL, moduleName)
+	data, err := safeHTTPGet(paramsURL)
+	if err == nil && len(data) > 0 && string(data) != "null" && string(data) != "{}" {
+		return data, nil
+	}
+
+	// If all attempts failed, return an error
+	return nil, fmt.Errorf("failed to fetch %s module state from %s (no valid endpoints found)", moduleName, restURL)
 }
 
 // fetchPaginatedResource fetches a paginated resource and returns the combined result
@@ -493,83 +494,73 @@ func fetchPaginatedResource(restURL, endpoint, resultKey string) (json.RawMessag
 			return nil, err
 		}
 
-		var result struct {
+		var rawResp struct {
 			Pagination struct {
 				NextKey string `json:"next_key"`
+				Total   string `json:"total"`
 			} `json:"pagination"`
+			Results json.RawMessage `json:"-"` // Will match to the resultKey
 		}
 
-		if err := json.Unmarshal(data, &result); err != nil {
-			return nil, err
+		// Parse the outer structure to get pagination info
+		if err := json.Unmarshal(data, &rawResp); err != nil {
+			return nil, fmt.Errorf("failed to parse pagination response: %w", err)
 		}
 
-		// Extract the items array
-		var resultData map[string]json.RawMessage
-		if err := json.Unmarshal(data, &resultData); err != nil {
-			return nil, err
+		// Extract items using the resultKey
+		var tempMap map[string]json.RawMessage
+		if err := json.Unmarshal(data, &tempMap); err != nil {
+			return nil, fmt.Errorf("failed to extract %s from response: %w", resultKey, err)
 		}
 
-		itemsData, ok := resultData[resultKey]
-		if ok {
-			var items []json.RawMessage
-			if err := json.Unmarshal(itemsData, &items); err != nil {
-				return nil, err
+		if items, ok := tempMap[resultKey]; ok && len(items) > 0 {
+			var currentItems []json.RawMessage
+			if err := json.Unmarshal(items, &currentItems); err != nil {
+				return nil, fmt.Errorf("failed to parse %s items: %w", resultKey, err)
 			}
-			allItems = append(allItems, items...)
+			allItems = append(allItems, currentItems...)
 		}
 
-		// Check if there are more pages
-		if result.Pagination.NextKey == "" {
+		// Check if we need to continue pagination
+		if rawResp.Pagination.NextKey == "" {
 			break
 		}
-		nextKey = result.Pagination.NextKey
+		nextKey = rawResp.Pagination.NextKey
 	}
 
-	// Combine all items into a single array
-	return json.Marshal(allItems)
-}
-
-// safeHTTPGet is a wrapper that doesn't error on 404s
-func safeHTTPGet(url string) (json.RawMessage, error) {
-	data, err := HTTPGet(url)
+	// Return the combined results
+	result, err := json.Marshal(allItems)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to marshal combined results: %w", err)
 	}
-	return data, nil
+
+	return result, nil
 }
 
-// scanForModuleEndpoints attempts to discover endpoints by common patterns
-func scanForModuleEndpoints(restURL, moduleName string) map[string]json.RawMessage {
-	results := make(map[string]json.RawMessage)
+// safeHTTPGet performs an HTTP GET request with timeout and error handling
+func safeHTTPGet(url string) (json.RawMessage, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
-	// Common Cosmos SDK module endpoint suffixes to try
-	commonSuffixes := []string{
-		"params",
-		"supply",
-		"list",
-		"total",
-		"info",
-		"status",
-		"metadata",
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request for %s: %w", url, err)
 	}
 
-	for _, suffix := range commonSuffixes {
-		endpoint := fmt.Sprintf("/cosmos/%s/v1beta1/%s", moduleName, suffix)
-		data, err := safeHTTPGet(fmt.Sprintf("%s%s", restURL, endpoint))
-		if err == nil && len(data) > 0 {
-			results[suffix] = data
-		}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request to %s failed: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body from %s: %w", url, err)
 	}
 
-	return results
-}
-
-// Helper function to check if a string is in a slice
-func containsString(slice []string, item string) bool {
-	for _, s := range slice {
-		if s == item {
-			return true
-		}
+	if resp.StatusCode >= 400 {
+		return body, fmt.Errorf("request to %s failed with status %d: %s", url, resp.StatusCode, string(body))
 	}
-	return false
+
+	return body, nil
 }

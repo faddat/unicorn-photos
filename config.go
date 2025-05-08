@@ -153,3 +153,69 @@ func LoadConfig() (*Config, error) {
 
 	return &cfg, nil
 }
+
+// SaveConfig saves the configuration to a TOML file
+func SaveConfig(config *Config, filePath string) error {
+	// Create a new viper instance to save the config
+	v := viper.New()
+
+	// Set the values from our config struct
+	v.Set("snapshot_base_dir", config.SnapshotBaseDir)
+	v.Set("ipfs_repo_path", config.IPFSRepoPath)
+	v.Set("chain_registry_path", config.ChainRegistryPath)
+	v.Set("max_pinned_size_gb", config.MaxPinnedSizeGB)
+	v.Set("all_chains", config.AllChains)
+	v.Set("chains_to_snapshot", config.ChainsToSnapshot)
+	v.Set("global_snapshot_interval", config.GlobalSnapshotIntervalRaw)
+	v.Set("global_max_snapshots_to_keep", config.GlobalMaxSnapshotsToKeep)
+	v.Set("global_prune_interval", config.GlobalPruneInterval.String())
+	v.Set("log_level", config.LogLevel)
+	v.Set("bootstrap_peers", config.BootstrapPeers)
+
+	// If there are chain overrides, set those too
+	if len(config.ChainOverrides) > 0 {
+		var overridesMap []map[string]interface{}
+		for _, override := range config.ChainOverrides {
+			overrideMap := map[string]interface{}{
+				"name":              override.Name,
+				"chain_id":          override.ChainID,
+				"rpc_endpoints":     override.RPCEndpoints,
+				"rest_endpoints":    override.RESTEndpoints,
+				"seed_nodes_p2p":    override.SeedNodesP2P,
+				"snapshot_interval": override.SnapshotIntervalRaw,
+			}
+			if override.Enabled != nil {
+				overrideMap["enabled"] = *override.Enabled
+			}
+			if override.MaxSnapshotsToKeepPerChain != nil {
+				overrideMap["max_snapshots_to_keep"] = *override.MaxSnapshotsToKeepPerChain
+			}
+			if override.EnablePeerDiscoveryFallback != nil {
+				overrideMap["enable_peer_discovery_fallback"] = *override.EnablePeerDiscoveryFallback
+			}
+			overridesMap = append(overridesMap, overrideMap)
+		}
+		v.Set("chains", overridesMap)
+	}
+
+	// Set up the config file location
+	v.SetConfigFile(filePath)
+	v.SetConfigType("toml")
+
+	// Ensure parent directory exists
+	dir := filepath.Dir(filePath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory %s: %w", dir, err)
+	}
+
+	// Write the config file
+	if err := v.WriteConfig(); err != nil {
+		// If the file doesn't exist, use SafeWriteConfig
+		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
+			return v.SafeWriteConfig()
+		}
+		return fmt.Errorf("failed to write config file: %w", err)
+	}
+
+	return nil
+}

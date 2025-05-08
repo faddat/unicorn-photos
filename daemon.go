@@ -107,6 +107,14 @@ func runDaemon(ctx context.Context) error {
 
 	logger.Printf("Starting Unicorn Photos IPFS snapshot daemon")
 
+	// Initialize and start the status tracker
+	statusTracker := GetStatusTracker()
+	if err := statusTracker.LoadStatusFile(); err != nil {
+		logger.Printf("Warning: Failed to load existing status file: %v", err)
+	}
+	statusTracker.Start()
+	defer statusTracker.Stop() // Ensure the status tracker is stopped when daemon exits
+
 	// Override config to set all_chains to true
 	config.AllChains = true
 	logger.Printf("Setting all_chains=true to process all chains in the registry")
@@ -322,6 +330,16 @@ func runDaemon(ctx context.Context) error {
 		}
 	}
 
+	// Log the total number of chains that will be processed
+	logger.Printf("Preparing to snapshot %d total chains", len(chainsToProcess))
+
+	// Register all chains with the status tracker
+	for chainID, rtConfig := range chainsToProcess {
+		if rtConfig.Enabled {
+			statusTracker.RegisterChain(chainID, rtConfig.Name)
+		}
+	}
+
 	// --- Launch Goroutines ---
 	var wg sync.WaitGroup
 	finalChainCount := 0
@@ -363,6 +381,10 @@ func runDaemon(ctx context.Context) error {
 	logger.Printf("Daemon shutting down...")
 	wg.Wait()
 	logger.Printf("All chain processors stopped.")
+
+	// Final status update before exit
+	statusTracker.LogStatusSummary()
+
 	return ctx.Err()
 }
 
@@ -560,54 +582,96 @@ func runChainSnapshotter(ctx context.Context, chainConfig *ChainRuntimeConfig, g
 	}
 }
 
-// Updated takeAndProcessSnapshotForChain to accept ChainRuntimeConfig
+// Updated takeAndProcessSnapshotForChain to track status
 func takeAndProcessSnapshotForChain(ctx context.Context, chainConfig *ChainRuntimeConfig, globalConfig *Config, ipfs *IPFSNode) error {
+	// Update status to "active" when attempting a snapshot
+	statusTracker := GetStatusTracker()
+	status := ChainStatus{
+		ChainID:              chainConfig.ChainID,
+		Name:                 chainConfig.Name,
+		LastAttemptedHeight:  chainConfig.LastAttemptedSnapshotHeight,
+		LastSuccessfulHeight: chainConfig.LastSuccessfulSnapshotHeight,
+		Status:               "active",
+	}
+	statusTracker.UpdateChainStatus(chainConfig.ChainID, status)
+
 	logger.Printf("[%s / %s] Checking for new blocks...", chainConfig.Name, chainConfig.ChainID)
 
-	// Need to adapt getHealthyEndpoint to work with ChainRuntimeConfig
-	rpcURL, err := getHealthyEndpointRuntime(ctx, chainConfig, "rpc") // New helper? Or adapt existing one
+	rpcURL, err := getHealthyEndpointRuntime(ctx, chainConfig, "rpc")
 	if err != nil {
-		return fmt.Errorf("[%s] no healthy RPC endpoint found: %w", chainConfig.ChainID, err)
+		errMsg := fmt.Sprintf("[%s] no healthy RPC endpoint found: %v", chainConfig.ChainID, err)
+		status.Status = "error"
+		status.LastError = errMsg
+		statusTracker.UpdateChainStatus(chainConfig.ChainID, status)
+		return fmt.Errorf(errMsg)
 	}
 
 	height, err := getLatestBlockHeight(rpcURL)
 	if err != nil {
-		return fmt.Errorf("[%s] failed to get latest block height from %s: %w", chainConfig.ChainID, rpcURL, err)
+		errMsg := fmt.Sprintf("[%s] failed to get latest block height from %s: %v", chainConfig.ChainID, rpcURL, err)
+		status.Status = "error"
+		status.LastError = errMsg
+		statusTracker.UpdateChainStatus(chainConfig.ChainID, status)
+		return fmt.Errorf(errMsg)
 	}
 
 	if height <= chainConfig.LastSuccessfulSnapshotHeight && chainConfig.LastSuccessfulSnapshotHeight > 0 {
-		return nil // No new blocks
+		// No new blocks, update status to "completed"
+		status.Status = "completed"
+		statusTracker.UpdateChainStatus(chainConfig.ChainID, status)
+		return nil
 	}
+
 	if height == chainConfig.LastAttemptedSnapshotHeight && chainConfig.LastAttemptedSnapshotHeight > 0 {
 		logger.Printf("[%s / %s] Height %d was already attempted. Skipping.", chainConfig.Name, chainConfig.ChainID, height)
+		// Update status to "completed" since we're skipping
+		status.Status = "completed"
+		statusTracker.UpdateChainStatus(chainConfig.ChainID, status)
 		return nil
 	}
 
 	logger.Printf("[%s / %s] Attempting snapshot for height: %d", chainConfig.Name, chainConfig.ChainID, height)
-	chainConfig.LastAttemptedSnapshotHeight = height // Mark attempt
+	chainConfig.LastAttemptedSnapshotHeight = height
+	status.LastAttemptedHeight = height
+	statusTracker.UpdateChainStatus(chainConfig.ChainID, status)
 
-	chainSnapshotBaseDir := filepath.Join(globalConfig.SnapshotBaseDir, chainConfig.ChainID) // Use ChainID for folder structure
+	chainSnapshotBaseDir := filepath.Join(globalConfig.SnapshotBaseDir, chainConfig.ChainID)
 	snapshotDir, err := ensureSnapshotDir(height, chainSnapshotBaseDir)
 	if err != nil {
-		return fmt.Errorf("[%s] failed ensure snapshot dir %s: %w", chainConfig.ChainID, chainSnapshotBaseDir, err)
+		errMsg := fmt.Sprintf("[%s] failed ensure snapshot dir %s: %v", chainConfig.ChainID, chainSnapshotBaseDir, err)
+		status.Status = "error"
+		status.LastError = errMsg
+		statusTracker.UpdateChainStatus(chainConfig.ChainID, status)
+		return fmt.Errorf(errMsg)
 	}
 
 	restURL, err := getHealthyEndpointRuntime(ctx, chainConfig, "rest")
 	if err != nil {
-		return fmt.Errorf("[%s] no healthy REST endpoint found: %w", chainConfig.ChainID, err)
+		errMsg := fmt.Sprintf("[%s] no healthy REST endpoint found: %v", chainConfig.ChainID, err)
+		status.Status = "error"
+		status.LastError = errMsg
+		statusTracker.UpdateChainStatus(chainConfig.ChainID, status)
+		return fmt.Errorf(errMsg)
 	}
 	logger.Printf("[%s / %s] Using REST endpoint: %s for height %d", chainConfig.Name, chainConfig.ChainID, restURL, height)
 
-	// Pass ChainRuntimeConfig to takeSnapshot
 	if err := takeSnapshotRuntime(height, *chainConfig, restURL, snapshotDir); err != nil {
-		logger.Printf("[%s / %s] Error during snapshot creation/saving height %d: %v", chainConfig.Name, chainConfig.ChainID, height, err)
+		errMsg := fmt.Sprintf("[%s / %s] Error during snapshot creation/saving height %d: %v", chainConfig.Name, chainConfig.ChainID, height, err)
+		logger.Printf(errMsg)
+		status.Status = "error"
+		status.LastError = errMsg
+		statusTracker.UpdateChainStatus(chainConfig.ChainID, status)
 		return fmt.Errorf("[%s] failed take snapshot: %w", chainConfig.ChainID, err)
 	}
 
 	// Add to IPFS
 	cid, err := ipfs.AddPath(snapshotDir)
 	if err != nil {
-		logger.Printf("[%s / %s] Warning: Snapshot dir %s created but failed add to IPFS: %v", chainConfig.Name, chainConfig.ChainID, snapshotDir, err)
+		errMsg := fmt.Sprintf("[%s / %s] Warning: Snapshot dir %s created but failed add to IPFS: %v", chainConfig.Name, chainConfig.ChainID, snapshotDir, err)
+		logger.Printf(errMsg)
+		status.Status = "error"
+		status.LastError = errMsg
+		statusTracker.UpdateChainStatus(chainConfig.ChainID, status)
 		return fmt.Errorf("failed add snapshot dir %s to IPFS: %w", snapshotDir, err)
 	}
 	logger.Printf("[%s / %s] Added snapshot height %d to IPFS. CID: %s", chainConfig.Name, chainConfig.ChainID, height, cid)
@@ -620,6 +684,11 @@ func takeAndProcessSnapshotForChain(ctx context.Context, chainConfig *ChainRunti
 
 	// Mark successful
 	chainConfig.LastSuccessfulSnapshotHeight = height
+	status.LastSuccessfulHeight = height
+	status.LastSnapshotTimestamp = time.Now()
+	status.Status = "completed"
+	statusTracker.UpdateChainStatus(chainConfig.ChainID, status)
+
 	logger.Printf("[%s / %s] Successfully processed snapshot height %d (CID: %s).", chainConfig.Name, chainConfig.ChainID, height, cid)
 	return nil
 }

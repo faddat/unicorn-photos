@@ -86,13 +86,13 @@ func LoadConfig() (*Config, error) {
 	viper.SetDefault("max_pinned_size_gb", 100)
 	viper.SetDefault("log_level", "info")
 	viper.SetDefault("bootstrap_peers", []string{})
-	viper.SetDefault("chain_registry_path", "") // No default, MUST be set if needed
+	viper.SetDefault("chain_registry_path", "~/.chain-registry")
 	viper.SetDefault("all_chains", false)
 	viper.SetDefault("chains_to_snapshot", []string{})
 	viper.SetDefault("global_snapshot_interval", "4h")
 	viper.SetDefault("global_max_snapshots_to_keep", 10)
 	viper.SetDefault("global_prune_interval", "1h")
-	viper.SetDefault("pruning_threshold_gb", 0) // Disable global size pruning by default
+	viper.SetDefault("pruning_threshold_gb", 69)
 
 	if err := viper.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); ok {

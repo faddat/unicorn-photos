@@ -1,0 +1,32 @@
+snapshot_base_dir = "snapshots"
+ipfs_repo_path = "~/.unicorn-photos/ipfs"
+max_pinned_size_gb = 100
+global_snapshot_interval = "4h" # Default interval if not set per chain
+pruning_threshold_gb = 69
+log_level = "info" # e.g., debug, info, warn, error
+
+[[chains]]
+name = "Cosmos Hub"
+chain_id = "cosmoshub-4"
+enabled = true
+# If rpc_endpoints/rest_endpoints are empty, or if force_discovery = true, discovery will be attempted.
+rpc_endpoints = ["https://rpc.cosmoshub.quicksilver.zone:443"] # Known reliable endpoints
+rest_endpoints = ["https://rest.cosmoshub.quicksilver.zone:443"]
+# P2P Seed nodes (host:port) for discovery if primary endpoints fail or discovery is forced
+# These are for the Tendermint P2P network, not necessarily RPC/REST servers themselves.
+# The discovery will try to find RPC/REST on the IPs derived from these peers.
+seed_nodes_p2p = ["ede627951c7470029f0efe90fc311d35507c0979@seed-01.cosmoshub-4.public.pemlabs.com:26656", "cf8330179ed78294c703647064fd963134403801@seed-02.cosmoshub-4.public.pemlabs.com:26656"]
+enable_peer_discovery_fallback = true # If true, use peer discovery if configured endpoints fail
+snapshot_interval = "1h" # Use "0s" for "as frequent as possible"
+
+[[chains]]
+name = "Osmosis"
+chain_id = "osmosis-1"
+enabled = true
+rpc_endpoints = ["https://rpc.osmosis.zone:443"]
+rest_endpoints = ["https://lcd.osmosis.zone:443"]
+seed_nodes_p2p = ["ade4d8bc8cbe014af6ebdf3cb7b1e9ad36f412c0@seeds.polkachu.com:12556"] # Example from chain-registry
+enable_peer_discovery_fallback = true
+snapshot_interval = "0s" # This chain will snapshot as frequently as possible
+
+# Add more chains as needed

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -35,6 +36,69 @@ func getChainEndpointsState(chainID string) *ChainEndpointsState {
 	return chainEndpoints[chainID]
 }
 
+// runGitCommand executes a git command with context and timeout
+func runGitCommand(ctx context.Context, timeout time.Duration, dir string, args ...string) error {
+	cmdCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	cmdArgs := []string{}
+	if dir != "" {
+		// Check if dir exists before trying to run command in it
+		if _, err := os.Stat(dir); os.IsNotExist(err) {
+			// If the command isn't 'clone', this is likely an error
+			if len(args) > 0 && args[0] != "clone" {
+				return fmt.Errorf("git directory %s does not exist", dir)
+			}
+			// For clone, dir is the target, so it might not exist yet, which is fine.
+		} else {
+			cmdArgs = append(cmdArgs, "-C", dir)
+		}
+	}
+	cmdArgs = append(cmdArgs, args...)
+
+	// If the command is 'clone', the target dir is the last argument
+	if len(args) > 0 && args[0] == "clone" && dir != "" {
+		// Ensure clone command includes the target directory if -C wasn't used (dir didn't exist)
+		hasTargetDirArg := false
+		if len(cmdArgs) > 0 {
+			lastArg := cmdArgs[len(cmdArgs)-1]
+			// A simple check, might need refinement if repo URL could look like a path
+			if !strings.HasPrefix(lastArg, "-") && !strings.Contains(lastArg, "://") {
+				hasTargetDirArg = true
+			}
+		}
+		if !hasTargetDirArg {
+			cmdArgs = append(cmdArgs, dir) // Add target dir explicitly
+		}
+		// Remove -C flag if present, as clone target is now explicit
+		filteredArgs := []string{}
+		for i := 0; i < len(cmdArgs); i++ {
+			if cmdArgs[i] == "-C" {
+				i++ // Skip the directory path as well
+				continue
+			}
+			filteredArgs = append(filteredArgs, cmdArgs[i])
+		}
+		cmdArgs = filteredArgs
+	}
+
+	cmd := exec.CommandContext(cmdCtx, "git", cmdArgs...)
+	logger.Printf("Running git command: %s", cmd.String())
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git command failed: %w\nOutput:\n%s", err, string(output))
+	}
+	logger.Printf("Git command successful. Output:\n%s", string(output))
+	return nil
+}
+
+// isGitRepo checks if a path is a git repository (.git exists)
+func isGitRepo(path string) bool {
+	gitPath := filepath.Join(path, ".git")
+	_, err := os.Stat(gitPath)
+	return err == nil // If .git exists (no error), it's likely a git repo
+}
+
 func runDaemon(ctx context.Context) error {
 	config, err := LoadConfig()
 	if err != nil {
@@ -42,6 +106,70 @@ func runDaemon(ctx context.Context) error {
 	}
 
 	logger.Printf("Starting Unicorn Photos IPFS snapshot daemon")
+
+	// --- Determine and Manage Chain Registry Path ---
+	userHome, err := os.UserHomeDir()
+	if err != nil {
+		logger.Printf("Warning: Could not determine user home directory: %v", err)
+		// Proceed, but ~ expansion and default path will fail if needed
+	}
+
+	registryPathInput := config.ChainRegistryPath // Default is "~/.chain-registry"
+	effectiveRegistryPath := registryPathInput
+	useManagedDefault := false
+	defaultManagedPath := ""
+
+	if userHome != "" {
+		defaultManagedPath = filepath.Join(userHome, ".chain-registry")
+		if strings.HasPrefix(registryPathInput, "~/") {
+			effectiveRegistryPath = filepath.Join(userHome, registryPathInput[2:])
+		}
+	}
+	// Clean the path
+	effectiveRegistryPath = filepath.Clean(effectiveRegistryPath)
+
+	// Check if the effective path matches the default managed path
+	if effectiveRegistryPath == defaultManagedPath {
+		useManagedDefault = true
+	}
+
+	registryPathToLoad := effectiveRegistryPath // This path will be passed to LoadRegistryChains
+
+	if useManagedDefault {
+		logger.Printf("Managing chain registry at default location: %s", defaultManagedPath)
+		registryPathToLoad = defaultManagedPath // Ensure we use the resolved default path
+		_, err := os.Stat(defaultManagedPath)
+		if os.IsNotExist(err) {
+			logger.Printf("Cloning cosmos/chain-registry to %s...", defaultManagedPath)
+			gitErr := runGitCommand(ctx, 2*time.Minute, defaultManagedPath, "clone", "https://github.com/cosmos/chain-registry", ".")
+			if gitErr != nil {
+				logger.Printf("ERROR: Failed to clone chain registry: %v. Registry data may be unavailable.", gitErr)
+				// Proceed, LoadRegistryChains should handle missing dir
+			} else {
+				logger.Printf("Chain registry successfully cloned.")
+			}
+		} else if err == nil { // Directory exists
+			if isGitRepo(defaultManagedPath) {
+				logger.Printf("Updating chain registry at %s...", defaultManagedPath)
+				gitErr := runGitCommand(ctx, 1*time.Minute, defaultManagedPath, "fetch", "origin")
+				if gitErr == nil {
+					gitErr = runGitCommand(ctx, 1*time.Minute, defaultManagedPath, "reset", "--hard", "origin/main")
+				}
+				if gitErr != nil {
+					logger.Printf("Warning: Failed to update chain registry git repo at %s: %v. Using existing local data.", defaultManagedPath, gitErr)
+				} else {
+					logger.Printf("Chain registry successfully updated.")
+				}
+			} else {
+				logger.Printf("Warning: Path %s exists but is not a git repository. Using as is, updates disabled.", defaultManagedPath)
+			}
+		} else { // Other error stating the directory
+			logger.Printf("Error checking chain registry path %s: %v. Trying to proceed.", defaultManagedPath, err)
+		}
+	} else {
+		logger.Printf("Using user-specified chain registry path: %s", effectiveRegistryPath)
+	}
+
 	logger.Printf("Snapshot Base Directory: %s", config.SnapshotBaseDir)
 	logger.Printf("Chain Registry Path: %s", config.ChainRegistryPath)
 	logger.Printf("Snapshot All Chains: %t", config.AllChains)
@@ -67,14 +195,12 @@ func runDaemon(ctx context.Context) error {
 		configOverrides[config.ChainOverrides[i].Name] = &config.ChainOverrides[i]
 	}
 
-	// Load from registry if needed
+	// Load from registry if needed, now using registryPathToLoad
 	var registryChains map[string]*BasicChainInfo
 	if config.AllChains || len(config.ChainsToSnapshot) > 0 {
-		registryChains, err = LoadRegistryChains(config.ChainRegistryPath, "mainnet")
+		registryChains, err = LoadRegistryChains(registryPathToLoad, "mainnet") // Use the determined path
 		if err != nil {
-			// If registry fails, we can only process chains explicitly defined in overrides
-			logger.Printf("Error loading chain registry: %v. Only chains defined explicitly in config [[chains]] will be processed.", err)
-			// Proceed, but registryChains will be nil
+			logger.Printf("Error loading chain registry from %s: %v. Only chains defined explicitly in config [[chains]] will be processed.", registryPathToLoad, err)
 		}
 	}
 

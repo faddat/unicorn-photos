@@ -13,11 +13,37 @@ import (
 // Command to display snapshot status information
 func cmdStatus() error {
 	baseDir := "snapshots"
+
+	// Create the snapshots directory if it doesn't exist
+	if _, err := os.Stat(baseDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(baseDir, 0755); err != nil {
+			return fmt.Errorf("failed to create snapshots directory: %w", err)
+		}
+		fmt.Println("=== Unicorn Photos - Status ===")
+		fmt.Println("No snapshots have been taken yet.")
+		fmt.Println("\nTo start the snapshot daemon, run:")
+		fmt.Println("  unicorn-photos run")
+		fmt.Println("\nThis will initialize the status tracking system and begin snapshotting chains.")
+		return nil
+	}
+
 	statusFilePath := filepath.Join(baseDir, "status.json")
 
 	// Check if status file exists
 	if _, err := os.Stat(statusFilePath); os.IsNotExist(err) {
-		return fmt.Errorf("status file not found at %s - daemon may not be running or has not created any snapshots yet", statusFilePath)
+		// Create a default status tracker with a helpful message
+		fmt.Println("=== Unicorn Photos - Status ===")
+		fmt.Println("Snapshot daemon has not been started yet.")
+		fmt.Println("\nTo start the snapshot daemon, run:")
+		fmt.Println("  unicorn-photos run")
+		fmt.Println("\nThis will initialize the status tracking system and begin snapshotting chains.")
+
+		// Initialize a default status file
+		statusTracker := GetStatusTracker()
+		if err := statusTracker.SaveStatusFile(); err != nil {
+			return fmt.Errorf("failed to create initial status file: %w", err)
+		}
+		return nil
 	}
 
 	// Read the status file
@@ -46,6 +72,14 @@ func cmdStatus() error {
 	fmt.Printf("Total snapshots:     %d\n", status.TotalSnapshots)
 	fmt.Println()
 
+	// If there are no chains yet, display a helpful message
+	if status.TotalChains == 0 {
+		fmt.Println("No chains have been configured for snapshotting yet.")
+		fmt.Println("Make sure your config.toml contains valid chain configurations.")
+		fmt.Println("The daemon will automatically discover and register chains.")
+		return nil
+	}
+
 	// Convert map to sortable slice
 	var chainStatuses []ChainStatus
 	for _, status := range status.ChainStatuses {
@@ -70,6 +104,17 @@ func cmdStatus() error {
 			chainStatus.SnapshotCount,
 			chainStatus.LastSuccessfulHeight,
 		)
+
+		// If there's a snapshot in progress, show progress details
+		if chainStatus.Status == "active" && chainStatus.LastProgress != nil {
+			progress := chainStatus.LastProgress
+			fmt.Printf("  └─ %s: %d%% complete - Current module: %s (%d/%d modules completed)\n",
+				formatTimeSince(progress.StartTime),
+				progress.PercentComplete,
+				progress.CurrentModule,
+				len(progress.CompletedModules),
+				progress.TotalModules)
+		}
 	}
 
 	// Output error details if any
@@ -95,4 +140,17 @@ func truncateString(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen-3] + "..."
+}
+
+// Helper function to format time since nicely
+func formatTimeSince(t time.Time) string {
+	duration := time.Since(t)
+	if duration < time.Minute {
+		return fmt.Sprintf("%d seconds", int(duration.Seconds()))
+	} else if duration < time.Hour {
+		return fmt.Sprintf("%d minutes", int(duration.Minutes()))
+	} else if duration < 24*time.Hour {
+		return fmt.Sprintf("%.1f hours", duration.Hours())
+	}
+	return fmt.Sprintf("%.1f days", duration.Hours()/24)
 }

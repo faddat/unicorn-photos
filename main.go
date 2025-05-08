@@ -317,7 +317,7 @@ func testChainCommand(args []string) error {
 
 	// Try to find RPC endpoint
 	fmt.Printf("Looking for a healthy RPC endpoint (timeout: 60s)...\n")
-	rpcEndpoint, err := getHealthyEndpointWithTimeout(ctx, runtimeConfig, "rpc", 60*time.Second)
+	rpcEndpoint, err := getHealthyEndpointWithTimeout(ctx, runtimeConfig, "rpc", 60*time.Second, config)
 	if err != nil {
 		fmt.Printf("❌ Failed to find RPC endpoint: %v\n", err)
 	} else {
@@ -334,7 +334,7 @@ func testChainCommand(args []string) error {
 
 	// Try to find REST endpoint
 	fmt.Printf("Looking for a healthy REST endpoint (timeout: 60s)...\n")
-	restEndpoint, err := getHealthyEndpointWithTimeout(ctx, runtimeConfig, "rest", 60*time.Second)
+	restEndpoint, err := getHealthyEndpointWithTimeout(ctx, runtimeConfig, "rest", 60*time.Second, config)
 	if err != nil {
 		fmt.Printf("❌ Failed to find REST endpoint: %v\n", err)
 	} else {

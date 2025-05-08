@@ -72,13 +72,33 @@ func DiscoverEndpoints(ctx context.Context, chainID string, seedRPCs []string, p
 		seedRPCs = validSeedRPCs
 	}
 
-	// 1. Start with P2P seed nodes directly if no RPCs
-	if len(seedRPCs) == 0 {
-		logger.Printf("[%s] No seed RPCs available, starting with P2P seed nodes directly", chainID)
-		// Get IPs from P2P seed node addresses
-		logger.Printf("[%s] Discover: Extracting IPs from P2P seed nodes: %v", chainID, p2pSeedNodes)
+	// Step 1: Start by querying /net_info from seed RPCs
+	// This is the most valuable source of peers as it gives actual connected peers
+	logger.Printf("[%s] Discovery: Querying seed RPCs for peers using /net_info...", chainID)
+	peerIPsFromRPC := getPeerIPsFromSeedRPCs(ctx, chainID, seedRPCs)
+	logger.Printf("[%s] Discovery: Found %d peer IPs from seed RPCs' /net_info", chainID, len(peerIPsFromRPC))
+
+	if len(peerIPsFromRPC) > 0 {
+		// We have peers from RPCs, queue them for probing first
+		for _, ip := range peerIPsFromRPC {
+			mu.Lock()
+			if !checkedIPs[ip] {
+				checkedIPs[ip] = true
+				wg.Add(1)
+				probeSemaphore <- struct{}{} // Acquire semaphore
+				go func(pIP string) {
+					defer wg.Done()
+					probeIPForServices(ctx, mu, pIP, chainID, &discovered, "discovered_peer")
+					<-probeSemaphore // Release semaphore
+				}(ip)
+			}
+			mu.Unlock()
+		}
+	} else if len(p2pSeedNodes) > 0 {
+		// If we couldn't get peers from RPCs, extract IPs from P2P seed nodes
+		logger.Printf("[%s] Discovery: No peers from seed RPCs, extracting IPs from P2P seed nodes...", chainID)
 		peerIPsFromP2PSeeds := getIPsFromP2PAddresses(p2pSeedNodes)
-		logger.Printf("[%s] Discover: Found %d IPs from P2P seed addresses", chainID, len(peerIPsFromP2PSeeds))
+		logger.Printf("[%s] Discovery: Found %d IPs from P2P seed addresses", chainID, len(peerIPsFromP2PSeeds))
 
 		// First probe these IPs directly as they might have RPC services
 		for _, ip := range peerIPsFromP2PSeeds {
@@ -96,10 +116,10 @@ func DiscoverEndpoints(ctx context.Context, chainID string, seedRPCs []string, p
 			mu.Unlock()
 		}
 
-		// Wait for first round of probing
+		// Wait for probing of initial P2P seeds to complete
 		wg.Wait()
 
-		// If we found some RPCs, use them to get more peers
+		// If we found RPCs from P2P seeds, use those to get more peers
 		var foundRPCs []string
 		mu.Lock()
 		for _, ep := range discovered {
@@ -110,62 +130,36 @@ func DiscoverEndpoints(ctx context.Context, chainID string, seedRPCs []string, p
 		mu.Unlock()
 
 		if len(foundRPCs) > 0 {
-			logger.Printf("[%s] Found %d RPC endpoints from seed nodes, using them to discover more peers", chainID, len(foundRPCs))
-			seedRPCs = foundRPCs // Use the discovered RPCs for next step
-		}
-	}
+			logger.Printf("[%s] Found %d RPC endpoints from P2P seed nodes, using them to discover more peers", chainID, len(foundRPCs))
+			moreIPsFromRPC := getPeerIPsFromSeedRPCs(ctx, chainID, foundRPCs)
+			logger.Printf("[%s] Discovery: Found %d more peer IPs from newly discovered RPCs", chainID, len(moreIPsFromRPC))
 
-	// 2. Get peer IPs from /net_info using available RPC endpoints
-	logger.Printf("[%s] Discover: Querying seed RPCs for peers: %v", chainID, seedRPCs)
-	peerIPsFromRPC := getPeerIPsFromSeedRPCs(ctx, chainID, seedRPCs)
-	logger.Printf("[%s] Discover: Found %d peer IPs from seed RPCs", chainID, len(peerIPsFromRPC))
-	for _, ip := range peerIPsFromRPC {
-		mu.Lock()
-		if !checkedIPs[ip] {
-			checkedIPs[ip] = true
-			wg.Add(1)
-			probeSemaphore <- struct{}{} // Acquire semaphore
-			go func(pIP string) {
-				defer wg.Done()
-				probeIPForServices(ctx, mu, pIP, chainID, &discovered, "discovered_peer")
-				<-probeSemaphore // Release semaphore
-			}(ip)
-		}
-		mu.Unlock()
-	}
-
-	// 3. Get any remaining IPs from P2P seed node addresses that weren't already checked
-	if seedRPCs == nil || len(seedRPCs) == 0 {
-		// We already processed these above if we had no seed RPCs
-		wg.Wait()
-	} else {
-		// If we had seed RPCs, check P2P seeds now for any we missed
-		logger.Printf("[%s] Discover: Extracting IPs from P2P seed nodes: %v", chainID, p2pSeedNodes)
-		peerIPsFromP2PSeeds := getIPsFromP2PAddresses(p2pSeedNodes)
-		logger.Printf("[%s] Discover: Found %d IPs from P2P seed addresses", chainID, len(peerIPsFromP2PSeeds))
-		for _, ip := range peerIPsFromP2PSeeds {
-			mu.Lock()
-			if !checkedIPs[ip] {
-				checkedIPs[ip] = true
-				wg.Add(1)
-				probeSemaphore <- struct{}{} // Acquire semaphore
-				go func(pIP string) {
-					defer wg.Done()
-					probeIPForServices(ctx, mu, pIP, chainID, &discovered, "discovered_seed")
-					<-probeSemaphore // Release semaphore
-				}(ip)
+			// Queue these additional peers for probing
+			for _, ip := range moreIPsFromRPC {
+				mu.Lock()
+				if !checkedIPs[ip] {
+					checkedIPs[ip] = true
+					wg.Add(1)
+					probeSemaphore <- struct{}{} // Acquire semaphore
+					go func(pIP string) {
+						defer wg.Done()
+						probeIPForServices(ctx, mu, pIP, chainID, &discovered, "discovered_peer")
+						<-probeSemaphore // Release semaphore
+					}(ip)
+				}
+				mu.Unlock()
 			}
-			mu.Unlock()
 		}
-		wg.Wait()
 	}
 
-	// Close semaphore channel once all goroutines are done
+	// Wait for all probing to complete
+	wg.Wait()
 	close(probeSemaphore)
 
 	// Count the number of RPC and REST endpoints discovered
 	rpcCount := 0
 	restCount := 0
+	mu.Lock()
 	for _, ep := range discovered {
 		if ep.Type == "rpc" {
 			rpcCount++
@@ -173,6 +167,7 @@ func DiscoverEndpoints(ctx context.Context, chainID string, seedRPCs []string, p
 			restCount++
 		}
 	}
+	mu.Unlock()
 
 	if len(discovered) == 0 {
 		logger.Printf("[%s] No new viable RPC/REST endpoints were discovered.", chainID)

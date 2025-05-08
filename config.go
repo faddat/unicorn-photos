@@ -46,15 +46,16 @@ type ChainRuntimeConfig struct {
 }
 
 type Config struct {
-	SnapshotBaseDir       string   `mapstructure:"snapshot_base_dir"`
-	IPFSRepoPath          string   `mapstructure:"ipfs_repo_path"`
-	MaxPinnedSizeGB       int64    `mapstructure:"max_pinned_size_gb"`
-	LogLevel              string   `mapstructure:"log_level"`
-	BootstrapPeers        []string `mapstructure:"bootstrap_peers"`      // IPFS bootstrap peers
-	MaxPinnedSizeBytes    int64    `mapstructure:"-"`                    // Calculated
-	PruningThresholdGB    int64    `mapstructure:"pruning_threshold_gb"` // For potential future global pruning
-	PruningThresholdBytes int64    `mapstructure:"-"`                    // Calculated
-	Debug                 bool     `mapstructure:"debug"`                // Enable debug mode
+	SnapshotBaseDir        string   `mapstructure:"snapshot_base_dir"`
+	IPFSRepoPath           string   `mapstructure:"ipfs_repo_path"`
+	MaxPinnedSizeGB        int64    `mapstructure:"max_pinned_size_gb"`
+	LogLevel               string   `mapstructure:"log_level"`
+	BootstrapPeers         []string `mapstructure:"bootstrap_peers"`          // IPFS bootstrap peers
+	MaxPinnedSizeBytes     int64    `mapstructure:"-"`                        // Calculated
+	PruningThresholdGB     int64    `mapstructure:"pruning_threshold_gb"`     // For potential future global pruning
+	PruningThresholdBytes  int64    `mapstructure:"-"`                        // Calculated
+	Debug                  bool     `mapstructure:"debug"`                    // Enable debug mode
+	AllowRegistryEndpoints bool     `mapstructure:"allow_registry_endpoints"` // Whether to allow using registry endpoints directly
 
 	// Chain Selection & Registry
 	ChainRegistryPath string   `mapstructure:"chain_registry_path"`
@@ -95,6 +96,7 @@ func LoadConfig() (*Config, error) {
 	viper.SetDefault("global_max_snapshots_to_keep", 10)
 	viper.SetDefault("global_prune_interval", "1h")
 	viper.SetDefault("pruning_threshold_gb", 69)
+	viper.SetDefault("allow_registry_endpoints", false) // Default to not allowing direct registry endpoints usage
 
 	if err := viper.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
@@ -173,6 +175,8 @@ func SaveConfig(config *Config, filePath string) error {
 	v.Set("global_prune_interval", config.GlobalPruneInterval.String())
 	v.Set("log_level", config.LogLevel)
 	v.Set("bootstrap_peers", config.BootstrapPeers)
+	v.Set("allow_registry_endpoints", config.AllowRegistryEndpoints)
+	v.Set("debug", config.Debug)
 
 	// If there are chain overrides, set those too
 	if len(config.ChainOverrides) > 0 {

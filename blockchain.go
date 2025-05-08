@@ -1,66 +1,50 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
+	// "encoding/json" // No longer directly used for this function
 	"fmt"
-	"io"
-	"net/http"
+	// "io" // No longer directly used
+	// "net/http" // Switching to cometbft client
 	"os"
-	"strconv"
+	// "strconv" // No longer directly used
 	"time"
+
+	comethttp "github.com/cometbft/cometbft/rpc/client/http"
 )
 
-// BlockchainRPCResponse represents a response from a blockchain RPC endpoint
-type BlockchainRPCResponse struct {
-	JSONRPC string `json:"jsonrpc"`
-	ID      int    `json:"id"`
-	Result  struct {
-		LastHeight string `json:"last_height"`
-	} `json:"result"`
-	Error interface{} `json:"error"`
-}
+// BlockchainRPCResponse is no longer used by getLatestBlockHeight with cometbft client
+// type BlockchainRPCResponse struct { ... }
 
-// getLatestBlockHeight queries the blockchain RPC endpoint to get the latest block height
-func getLatestBlockHeight() (int64, error) {
-	// For testing without an actual blockchain, return a fixed value
+// getLatestBlockHeight queries a specific blockchain RPC endpoint to get the latest block height.
+func getLatestBlockHeight(rpcURL string) (int64, error) { // Added rpcURL parameter
 	if os.Getenv("UNICORN_PHOTOS_TEST_MODE") == "true" {
-		logger.Printf("Running in test mode, returning mock block height")
+		logger.Printf("Running in test mode, returning mock block height 12345")
 		return 12345, nil
 	}
 
-	// In production, we'd query the actual blockchain
-	client := &http.Client{Timeout: 10 * time.Second}
-
-	// This URL would be configured in a real implementation
-	rpcURL := "https://rpc.unicorn.photos/status"
-	if url := os.Getenv("UNICORN_PHOTOS_RPC_URL"); url != "" {
-		rpcURL = url
-	}
-
-	resp, err := client.Get(rpcURL)
+	client, err := comethttp.New(rpcURL)
 	if err != nil {
-		return 0, fmt.Errorf("failed to query blockchain status: %w", err)
+		return 0, fmt.Errorf("failed to create CometBFT client for %s: %w", rpcURL, err)
 	}
-	defer resp.Body.Close()
+	// Setting timeout on the client itself if desired, or per call via context
+	// client.SetTimeout(20 * time.Second) // Example client-wide timeout
 
-	body, err := io.ReadAll(resp.Body)
+	statusCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second) // Per-call timeout
+	defer cancel()
+
+	status, err := client.Status(statusCtx)
 	if err != nil {
-		return 0, fmt.Errorf("failed to read response body: %w", err)
+		return 0, fmt.Errorf("failed to query /status from %s: %w", rpcURL, err)
 	}
 
-	var rpcResp BlockchainRPCResponse
-	if err := json.Unmarshal(body, &rpcResp); err != nil {
-		return 0, fmt.Errorf("failed to parse RPC response: %w", err)
+	if status == nil || status.SyncInfo.LatestBlockHeight == 0 {
+		// Log the actual status if it's not nil, for debugging
+		// if status != nil {
+		// 	logger.Printf("[%s] Warning: Invalid status response or zero block height. Status: %+v", rpcURL, status.SyncInfo)
+		// }
+		return 0, fmt.Errorf("invalid status response or zero block height from %s", rpcURL)
 	}
 
-	if rpcResp.Error != nil {
-		return 0, fmt.Errorf("RPC error: %v", rpcResp.Error)
-	}
-
-	height, err := strconv.ParseInt(rpcResp.Result.LastHeight, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("failed to parse block height: %w", err)
-	}
-
-	return height, nil
+	return status.SyncInfo.LatestBlockHeight, nil
 }

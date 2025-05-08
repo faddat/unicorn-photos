@@ -160,12 +160,11 @@ func getPeerIPsFromSeedRPCs(ctx context.Context, chainID string, seedRPCs []stri
 		wg.Add(1)
 		go func(addr string) {
 			defer wg.Done()
-			client, err := comethttp.New(addr, "/websocket") // Path doesn't matter for /net_info
+			client, err := comethttp.New(addr) // Path doesn't matter for /net_info
 			if err != nil {
 				// logger.Printf("[%s] Discovery: failed to create client for seed RPC %s: %v", chainID, addr, err)
 				return
 			}
-			client.SetTimeout(netInfoTimeout)
 
 			netInfoCtx, cancel := context.WithTimeout(ctx, netInfoTimeout)
 			defer cancel()
@@ -181,7 +180,7 @@ func getPeerIPsFromSeedRPCs(ctx context.Context, chainID string, seedRPCs []stri
 				// NodeInfo.ListenAddr is usually "tcp://ip:port"
 				// RemoteIP is just the IP string.
 				var potentialIPs []string
-				if peer.NodeInfo != nil && peer.NodeInfo.ListenAddr != "" {
+				if peer.NodeInfo.ListenAddr != "" {
 					matches := ipFromP2PRegex.FindStringSubmatch(peer.NodeInfo.ListenAddr)
 					if len(matches) > 1 {
 						potentialIPs = append(potentialIPs, matches[1])
@@ -257,7 +256,7 @@ func probeIPForServices(ctx context.Context, mu *sync.Mutex, ip, targetChainID s
 
 // checkRPC verifies if an RPC endpoint is alive and for the correct chain.
 func checkRPC(ctx context.Context, rpcURL, targetChainID string) error {
-	client, err := comethttp.New(rpcURL, "/websocket") // Default path for websocket, not critical for /status
+	client, err := comethttp.New(rpcURL) // Default path for websocket, not critical for /status
 	if err != nil {
 		return fmt.Errorf("create client for %s failed: %w", rpcURL, err)
 	}

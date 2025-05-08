@@ -284,7 +284,7 @@ func takeAndProcessSnapshotForChain(ctx context.Context, chainConfig *ChainConfi
 	}
 	logger.Printf("[%s] Using REST endpoint: %s", chainConfig.ChainID, restURL)
 
-	if err := takeSnapshot(height, *chainConfig, restURL, snapshotDir); err != nil {
+	if _, err := generateCosmosGenesisDoc(restURL, chainConfig.ChainID, height, snapshotDir); err != nil {
 		return fmt.Errorf("[%s] failed to take snapshot: %w", chainConfig.ChainID, err)
 	}
 

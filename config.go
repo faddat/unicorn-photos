@@ -53,6 +53,7 @@ type Config struct {
 	MaxPinnedSizeBytes    int64    `mapstructure:"-"`                    // Calculated
 	PruningThresholdGB    int64    `mapstructure:"pruning_threshold_gb"` // For potential future global pruning
 	PruningThresholdBytes int64    `mapstructure:"-"`                    // Calculated
+	Debug                 bool     `mapstructure:"debug"`                // Enable debug mode
 
 	// Chain Selection & Registry
 	ChainRegistryPath string   `mapstructure:"chain_registry_path"`
